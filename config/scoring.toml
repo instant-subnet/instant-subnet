@@ -1,0 +1,111 @@
+# Scoring weights and constants (DESIGN.md §8).
+#
+# Consensus-critical. Every validator must use identical values or they
+# compute different weights from the same observations and burn each other's
+# vtrust. Treat a change here the way you would treat a change to a chain
+# hyperparameter: announced, versioned, and rolled out to every validator
+# before it takes effect. `version.id` is what makes a partial rollout
+# visible instead of silent.
+#
+# All values are integers -- basis points where they are ratios. The scoring
+# code does no floating-point arithmetic at all, including the logarithm in
+# the capacity term, so two validators on different CPUs produce identical
+# weight vectors rather than nearly-identical ones.
+
+[version]
+id = 1
+
+[weights]
+# The §8.1 formula:
+#
+#   score = GATE x (0.45*L + 0.20*T + 0.25*R + 0.10*C)
+#
+# Must sum to 10000. Latency dominates because latency is the product.
+latency     = 4500   # L -- TTFT p95 against the SLO target
+throughput  = 2000   # T -- sustained tokens/sec, p50
+reliability = 2500   # R -- successes over attempts, all probe sources
+capacity    = 1000   # C -- demonstrated concurrency, log-scaled
+
+[sources]
+# §8.2 -- each component is measured from whichever source is hardest to
+# game, in basis points summing to 10000 per row.
+#
+# Shadow probes dominate latency and throughput because a miner cannot pick
+# them out of user traffic. Direct probes carry equal weight on reliability
+# because "is it up at all" cannot be selectively faked without being down
+# for everyone. Capacity comes only from telemetry because only real traffic
+# demonstrates it.
+latency_shadow      = 6500
+latency_direct      = 1500
+latency_telemetry   = 2000
+
+throughput_shadow    = 6500
+throughput_direct    = 1500
+throughput_telemetry = 2000
+
+reliability_shadow    = 4000
+reliability_direct    = 4000
+reliability_telemetry = 2000
+
+capacity_shadow    = 0
+capacity_direct    = 0
+capacity_telemetry = 10000
+
+[gate]
+# GATE is binary and multiplicative: a miner that fails any of these earns
+# nothing this epoch, rather than earning slightly less. §6.1 explains why
+# attestation in particular is a gate and not a score component.
+#
+# `warn_bps` is what GATE evaluates to in attestation_mode=warn -- a mode
+# that guards.py refuses to let run on finney at all.
+pass_bps = 10000
+warn_bps = 1500
+fail_bps = 0
+
+# Minimum successful probes in an epoch before a miner is scored at all.
+# Without it a miner that answered one probe perfectly outscores a miner
+# that answered four hundred.
+min_probes = 20
+
+# Consecutive epochs of gate failure before a miner is dropped from
+# rotation, and how long it stays out once dropped. Flapping in and out to
+# dodge probes should cost more than staying up.
+gate_out_after_misses = 2
+gate_out_cooldown_epochs = 1
+
+[normalisation]
+# Raw scores are cubed before normalising: w = s^3 / sum(s^3).
+#
+# Linear normalisation pays a miner at 0.7 seventy percent of what the
+# fastest miner gets, which is not enough pressure to actually be fastest.
+# Cubing makes the fastest miner earn disproportionately while the pack
+# still earns enough to stay online. If it proves too aggressive we lower
+# this number -- it is one constant, not a redesign.
+exponent = 3
+
+# EMA smoothing across epochs, basis points. 3000 = a score can move 30% of
+# the way to its new value per epoch, so one bad epoch does not delete a
+# miner and one good epoch does not mint one.
+ema_alpha_bps = 3000
+
+[probe]
+# Direct probes go straight to the miner. Shadow probes go through the
+# platform carrying a user-shaped request, so a miner cannot serve probes
+# better than it serves users -- it cannot tell them apart.
+direct_interval_s     = 60
+shadow_interval_s     = 30
+timeout_s             = 30
+max_concurrent_probes = 16
+max_tokens            = 256
+
+# Every probe prompt is prefixed with a random 16-byte nonce so no two
+# probes share a prompt-cache key. Without this a miner caches the probe and
+# reports a TTFT that measures its cache, not its hardware.
+prompt_nonce_bytes = 16
+
+[penalty]
+# Multipliers applied to the weighted sum, in basis points. These are for
+# behaviour that is wrong but not gate-worthy; anything that should end a
+# miner's epoch belongs in [gate] instead.
+receipt_mismatch   = 0      # signed for traffic it did not serve: not an error
+capacity_overclaim = 8000   # advertised more concurrency than it accepted

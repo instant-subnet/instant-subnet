@@ -1,0 +1,41 @@
+# The development model ladder (DESIGN.md §2.2.1).
+#
+# Never hardcode a model id anywhere else. Everything -- the PM2 vllm app,
+# the miner, the validator's expectations, CI -- reads a tier from here,
+# keyed by INSTANT_MODEL_TIER. Changing what we run is a one-line change to
+# an env var, not a grep across the repo.
+#
+# The tiers exist because developing against a 117B model is a bad use of
+# everyone's week, and because the alternative -- developing against an
+# unrelated small model -- defers every harmony and MXFP4 bug to launch.
+# Tier 1 is the same family as production, so the gap between them is size,
+# not behaviour.
+
+[dev0]
+# Protocol plumbing. CPU only, no GPU anywhere in the loop, runs in CI and
+# on a laptop. Attestation is stubbed here and only here.
+model_id       = "Qwen/Qwen2.5-0.5B-Instruct"
+max_model_len  = 8192
+min_vram_gb    = 0
+cpu_ok         = true
+attestation    = "off"
+served_by      = "vllm"
+
+[dev1]
+# The integration rig. Same family, same harmony template, same MXFP4
+# quantisation and the same vLLM build as production -- so a bug found here
+# is a bug that would have happened there.
+model_id       = "openai/gpt-oss-20b"
+max_model_len  = 131072
+min_vram_gb    = 16
+cpu_ok         = false
+attestation    = "hard"
+served_by      = "vllm"
+
+[prod]
+model_id       = "openai/gpt-oss-120b"
+max_model_len  = 131072
+min_vram_gb    = 80
+cpu_ok         = false
+attestation    = "hard"
+served_by      = "vllm"
