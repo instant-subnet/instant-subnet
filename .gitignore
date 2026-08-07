@@ -1,6 +1,10 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
 # Python
 .venv/
-.venv-*/
 venv/
 __pycache__/
 *.py[cod]
@@ -9,22 +13,16 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+build/
+dist/
 
-# Runtime state and local configuration
-.env
-.env.*
-!.env.*.example
-*.sqlite3
-*.sqlite3-shm
-*.sqlite3-wal
+# Runtime state
 logs/
+*.sqlite3
+*.sqlite3-*
 
-# Generated and private local material (never publish)
-deal/
-output/
-tmp/
-
-# Editor / OS
+# Editors and operating systems
 .DS_Store
 .idea/
 .vscode/
+*.swp
