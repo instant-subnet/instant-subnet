@@ -131,6 +131,9 @@ def test_defaults_are_the_documented_ones():
     assert s.wallet_hotkey == "default"
     assert s.miner_host == "0.0.0.0"
     assert s.miner_port == 8091
+    assert s.miner_external_ip == ""
+    assert s.mock_vllm_host == "127.0.0.1"
+    assert s.mock_vllm_port == 8000
     assert s.validator_host == "127.0.0.1"
     assert s.validator_port == 8092
     assert s.platform_port == 8090
@@ -139,6 +142,13 @@ def test_defaults_are_the_documented_ones():
     assert s.log_level == "INFO"
     assert s.allow_gpu_reuse is False
     assert s.allow_unpinned_weights is False
+    assert s.enable_weight_writes is False
+    assert s.expected_spec_version == 393
+    assert s.weight_mechanism_id == 0
+    assert s.weight_version_key == 0
+    assert s.weight_period_blocks == 8
+    assert s.telemetry_max_age_s == 120
+    assert s.telemetry_max_window_s == 7200
 
 
 def test_empty_string_reads_as_unset():
@@ -197,6 +207,14 @@ def test_tier_selects_the_model():
     assert s.tier.max_model_len == 131072
     assert s.tier.cpu_ok is False
     assert s.tier.is_production is False
+
+
+def test_mock_tier_never_claims_a_real_model():
+    tier = load_tier("mock")
+    assert tier.model_id == "instant/mock-echo"
+    assert tier.served_by == "mock"
+    assert tier.cpu_ok is True
+    assert tier.attestation == "off"
 
 
 def test_runtime_context_can_be_lower_than_the_tier_ceiling():
@@ -294,4 +312,7 @@ def test_settings_carries_no_secrets():
     fields = set(Settings.__dataclass_fields__)
     assert not {f for f in fields if "secret" in f or "seed" in f or "key" in f} - {
         "wallet_name", "wallet_hotkey",
+        # A one-way digest used for constant-time comparison, not a credential.
+        "platform_api_key_sha256",
+        "weight_version_key",
     }

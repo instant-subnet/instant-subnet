@@ -125,7 +125,7 @@ def _router(ctx: MinerContext) -> APIRouter:
 
     @router.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
-        ready = await ctx.vllm.health()
+        ready = await ctx.vllm.ready(ctx.model_id)
         if not ready:
             status = "loading" if ctx.uptime_s < 600 else "degraded"
         elif ctx.auth.accept.is_stale:
@@ -244,6 +244,10 @@ def _router(ctx: MinerContext) -> APIRouter:
         started_ms = int(time.time() * 1000)
 
         if parsed.stream:
+            # Reserve synchronously, before the StreamingResponse is returned.
+            # Incrementing inside the iterator lets several requests all pass
+            # the capacity check before any iterator starts.
+            ctx.in_flight += 1
             return _stream_response(ctx, payload, raw, request_id, verified.signed_by,
                                     started_ms)
 
@@ -298,7 +302,6 @@ def _stream_response(
     outcome = StreamOutcome()
 
     async def body_iter():
-        ctx.in_flight += 1
         try:
             async for chunk in ctx.vllm.stream(payload, outcome):
                 yield chunk

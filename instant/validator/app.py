@@ -67,4 +67,29 @@ def create_app(runtime: ValidatorRuntime, *, run_loop: bool = True) -> FastAPI:
             "scores": [] if epoch is None else runtime.state.scores_for_epoch(epoch),
         }
 
+    @app.get("/telemetry")
+    async def telemetry() -> dict:
+        epoch = runtime.state.latest_telemetry_epoch()
+        return {
+            "status": dict(runtime.telemetry_status),
+            "epoch": epoch,
+            "miners": (
+                [] if epoch is None else runtime.state.telemetry_for_epoch(epoch)
+            ),
+        }
+
+    @app.get("/scoring")
+    async def scoring() -> dict:
+        epoch = runtime.state.latest_epoch()
+        return {
+            "status": dict(runtime.scoring_status),
+            "epoch": epoch,
+            "scores": [] if epoch is None else runtime.state.scores_for_epoch(epoch),
+        }
+
+    @app.get("/weights")
+    async def weights() -> dict:
+        row = runtime.state.last_weight_set()
+        return {"last_attempt": None if row is None else dict(row)}
+
     return app

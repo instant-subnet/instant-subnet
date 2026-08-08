@@ -26,6 +26,9 @@ import httpx
 
 from .state import ValidatorState
 
+if False:  # pragma: no cover - typing-only without a runtime import cycle
+    from .coordinator import ScoringCoordinator
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -147,6 +150,7 @@ class ValidatorRuntime:
         refresh_s: int = 120,
         request_timeout_s: int = 30,
         http: httpx.AsyncClient | None = None,
+        coordinator: ScoringCoordinator | None = None,
     ) -> None:
         self.subtensor = subtensor
         self.wallet = wallet
@@ -157,6 +161,19 @@ class ValidatorRuntime:
         self.stale_after_ms = max(30, refresh_s * 3) * 1000
         self._owns_http = http is None
         self.http = http or httpx.AsyncClient(timeout=request_timeout_s)
+        self.coordinator = coordinator
+        self.telemetry_status: dict[str, Any] = {
+            "status": "not_run",
+            "last_attempt_ms": None,
+            "last_success_ms": None,
+            "error": None,
+        }
+        self.scoring_status: dict[str, Any] = {
+            "status": "not_run",
+            "last_attempt_ms": None,
+            "last_success_ms": None,
+            "error": None,
+        }
         hotkey = wallet.hotkey.ss58_address
         self.snapshot = ValidatorSnapshot(
             chain_connected=False,
@@ -229,6 +246,66 @@ class ValidatorRuntime:
         except httpx.HTTPError:
             return False
 
+    async def score_once(self) -> dict[str, Any]:
+        """Fetch authenticated telemetry and persist one score epoch.
+
+        This is called only by the explicit CLI action.  The continuous PM2
+        loop remains read-only and never advances scoring state on boot.
+        """
+        if self.coordinator is None:
+            raise RuntimeError("validator scoring coordinator is not configured")
+
+        attempt_ms = _now_ms()
+        self.telemetry_status = {
+            **self.telemetry_status,
+            "status": "fetching",
+            "last_attempt_ms": attempt_ms,
+            "error": None,
+        }
+        self.scoring_status = {
+            **self.scoring_status,
+            "status": "running",
+            "last_attempt_ms": attempt_ms,
+            "error": None,
+        }
+        snapshot = await self.sync_once()
+        try:
+            run, batch = await self.coordinator.run_once(snapshot)
+        except Exception as exc:  # noqa: BLE001 - operations status boundary
+            message = str(exc)
+            self.telemetry_status = {
+                **self.telemetry_status,
+                "status": "error",
+                "error": message,
+            }
+            self.scoring_status = {
+                **self.scoring_status,
+                "status": "error",
+                "error": message,
+            }
+            raise
+
+        success_ms = _now_ms()
+        self.telemetry_status = {
+            "status": "ok",
+            "last_attempt_ms": attempt_ms,
+            "last_success_ms": success_ms,
+            "error": None,
+            **batch.to_status(),
+        }
+        self.scoring_status = {
+            "status": "ok",
+            "last_attempt_ms": attempt_ms,
+            "last_success_ms": success_ms,
+            "error": None,
+            **run.to_payload(),
+        }
+        return {
+            "telemetry": dict(self.telemetry_status),
+            "scoring": dict(self.scoring_status),
+            "scores": self.state.scores_for_epoch(run.epoch),
+        }
+
     async def run(self) -> None:
         """Refresh forever; PM2 owns restart policy, this owns transient errors."""
 
@@ -237,6 +314,8 @@ class ValidatorRuntime:
             await self.sync_once()
 
     async def aclose(self) -> None:
+        if self.coordinator is not None:
+            await self.coordinator.aclose()
         if self._owns_http:
             await self.http.aclose()
         close = getattr(self.subtensor, "close", None)

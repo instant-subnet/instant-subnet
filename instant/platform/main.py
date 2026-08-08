@@ -15,6 +15,7 @@ import uvicorn
 from ..common.config import load_settings
 from ..common.guards import describe, enforce
 from .app import PlatformContext, create_app
+from .state import open_state
 
 log = logging.getLogger("instant.platform")
 
@@ -50,6 +51,7 @@ async def _check_miner(ctx: PlatformContext) -> tuple[bool, dict]:
         return False, {"error": str(exc)}
     finally:
         await ctx.http.aclose()
+        ctx.state.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,6 +100,11 @@ def main(argv: list[str] | None = None) -> int:
             miner_url=settings.platform_miner_url,
             miner_ss58=settings.platform_miner_ss58,
             http=httpx.AsyncClient(timeout=settings.request_timeout_s),
+            state=open_state(settings.platform_state_db),
+            api_key_sha256=settings.platform_api_key_sha256,
+            validator_hotkeys=frozenset({settings.platform_validator_ss58}),
+            miner_uid=settings.platform_miner_uid,
+            stats_window_s=settings.platform_stats_window_s,
         )
     except Exception as exc:  # noqa: BLE001
         log.error("platform initialization failed: %s", exc)

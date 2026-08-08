@@ -19,6 +19,9 @@ at 3am.
 
 from __future__ import annotations
 
+import ipaddress
+import re
+
 from ..protocol.ss58 import is_valid
 from .config import ConfigError, Settings
 
@@ -115,6 +118,13 @@ def enforce(settings: Settings, *, role: str = "miner") -> list[str]:
     if role == "miner":
         if settings.max_concurrent < 1:
             raise ConfigError("INSTANT_MAX_CONCURRENT must be at least 1")
+        if settings.miner_external_ip:
+            try:
+                ipaddress.ip_address(settings.miner_external_ip)
+            except ValueError as exc:
+                raise ConfigError(
+                    "INSTANT_MINER_EXTERNAL_IP must be a literal IPv4 or IPv6 address"
+                ) from exc
         if settings.platform_ss58 and not is_valid(settings.platform_ss58):
             raise ConfigError(
                 "INSTANT_PLATFORM_SS58 must be a valid Bittensor SS58 address"
@@ -126,6 +136,40 @@ def enforce(settings: Settings, *, role: str = "miner") -> list[str]:
     elif role == "validator":
         if settings.metagraph_refresh_s < 1:
             raise ConfigError("INSTANT_METAGRAPH_REFRESH_S must be at least 1")
+        if settings.telemetry_max_age_s < 1:
+            raise ConfigError("INSTANT_TELEMETRY_MAX_AGE_S must be at least 1")
+        if settings.telemetry_max_window_s < settings.telemetry_max_age_s:
+            raise ConfigError(
+                "INSTANT_TELEMETRY_MAX_WINDOW_S must be at least "
+                "INSTANT_TELEMETRY_MAX_AGE_S"
+            )
+        if settings.platform_ss58 and not is_valid(settings.platform_ss58):
+            raise ConfigError(
+                "INSTANT_PLATFORM_SS58 must be a valid Bittensor SS58 address"
+            )
+        if settings.expected_spec_version != 393:
+            raise ConfigError(
+                "the bounded localnet writer supports only runtime specVersion 393"
+            )
+        if settings.weight_mechanism_id != 0:
+            raise ConfigError("INSTANT_WEIGHT_MECHANISM_ID must be 0 for this subnet")
+        if settings.weight_version_key < 0:
+            raise ConfigError("INSTANT_WEIGHT_VERSION_KEY cannot be negative")
+        period = settings.weight_period_blocks
+        if period < 4 or period & (period - 1):
+            raise ConfigError(
+                "INSTANT_WEIGHT_PERIOD_BLOCKS must be a power of two of at least 4"
+            )
+        if settings.enable_weight_writes:
+            if settings.network != "local":
+                raise UnsafeConfiguration(
+                    "INSTANT_ENABLE_WEIGHT_WRITES=true is supported only on the "
+                    "explicit local network"
+                )
+            warnings.append(
+                "enable_weight_writes=true — only --set-weights-once can submit, "
+                "and every chain attempt is recorded. Localnet only."
+            )
         if mainnet and settings.netuid == 5:
             # netuid 5 is our localnet convention. On finney it is somebody
             # else's subnet, and setting weights there would be both useless
@@ -137,9 +181,14 @@ def enforce(settings: Settings, *, role: str = "miner") -> list[str]:
     elif role == "platform":
         if settings.request_timeout_s < 1:
             raise ConfigError("INSTANT_REQUEST_TIMEOUT_S must be at least 1")
+        if mainnet:
+            raise UnsafeConfiguration(
+                "The initial single-miner platform is localnet plumbing and "
+                "refuses to start on finney."
+            )
         if settings.platform_host not in {"127.0.0.1", "::1", "localhost"}:
             raise UnsafeConfiguration(
-                "The unauthenticated localnet platform must bind to loopback. "
+                "The local/test platform must bind to loopback. "
                 "Set INSTANT_PLATFORM_HOST=127.0.0.1 and expose only a protected "
                 "nginx route or SSH tunnel."
             )
@@ -152,12 +201,50 @@ def enforce(settings: Settings, *, role: str = "miner") -> list[str]:
             raise ConfigError(
                 "INSTANT_PLATFORM_MINER_SS58 must be a valid Bittensor SS58 address"
             )
-        if mainnet:
-            raise UnsafeConfiguration(
-                "The initial platform gateway intentionally has no user API-key "
-                "or quota layer. It is a localnet plumbing service and refuses "
-                "to start on finney."
+        if settings.platform_miner_uid < 0:
+            raise ConfigError("INSTANT_PLATFORM_MINER_UID must be at least 0")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", settings.platform_api_key_sha256):
+            raise ConfigError(
+                "INSTANT_PLATFORM_API_KEY_SHA256 must be the 64-character hex "
+                "SHA-256 digest of the Bearer API key"
             )
+        if not settings.platform_validator_ss58:
+            raise ConfigError(
+                "INSTANT_PLATFORM_VALIDATOR_SS58 is required so the validator "
+                "stats endpoint has an explicit Epistula accept-list"
+            )
+        if not is_valid(settings.platform_validator_ss58):
+            raise ConfigError(
+                "INSTANT_PLATFORM_VALIDATOR_SS58 must be a valid Bittensor SS58 address"
+            )
+        if settings.platform_stats_window_s < 1:
+            raise ConfigError("INSTANT_PLATFORM_STATS_WINDOW_S must be at least 1")
+    elif role == "mock":
+        if mainnet or settings.network not in {"local", "test"}:
+            raise UnsafeConfiguration(
+                "The mock inference worker may run only with "
+                "INSTANT_NETWORK=local or test."
+            )
+        if settings.tier.served_by != "mock":
+            raise UnsafeConfiguration(
+                "The mock inference worker requires INSTANT_MODEL_TIER=mock so "
+                "manifests cannot claim fixture output came from a real model."
+            )
+        if settings.attestation_mode != "off":
+            raise UnsafeConfiguration(
+                "The mock inference worker requires INSTANT_ATTESTATION_MODE=off."
+            )
+        if settings.mock_vllm_host not in {"127.0.0.1", "::1", "localhost"}:
+            raise UnsafeConfiguration(
+                "The mock inference worker must bind to loopback. Set "
+                "INSTANT_MOCK_VLLM_HOST=127.0.0.1."
+            )
+        if not 1 <= settings.mock_vllm_port <= 65_535:
+            raise ConfigError("INSTANT_MOCK_VLLM_PORT must be between 1 and 65535")
+        if settings.mock_first_token_delay_ms < 0:
+            raise ConfigError("INSTANT_MOCK_FIRST_TOKEN_DELAY_MS cannot be negative")
+        if settings.mock_token_delay_ms < 0:
+            raise ConfigError("INSTANT_MOCK_TOKEN_DELAY_MS cannot be negative")
     else:
         raise ConfigError(f"unknown role {role!r}")
 

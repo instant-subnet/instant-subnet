@@ -138,6 +138,23 @@ def test_cpu_tier_with_attestation_off_is_the_supported_dev_shape():
     assert all("cannot produce" not in w for w in warnings)
 
 
+def test_mock_worker_requires_the_explicit_mock_tier_and_loopback():
+    enforce(
+        settings(tier=load_tier("mock"), attestation_mode="off"), role="mock"
+    )
+    with pytest.raises(UnsafeConfiguration, match="INSTANT_MODEL_TIER=mock"):
+        enforce(settings(tier=load_tier("dev0")), role="mock")
+    with pytest.raises(UnsafeConfiguration, match="loopback"):
+        enforce(
+            settings(
+                tier=load_tier("mock"),
+                attestation_mode="off",
+                mock_vllm_host="0.0.0.0",
+            ),
+            role="mock",
+        )
+
+
 # --- chain endpoint ---------------------------------------------------------
 
 
@@ -195,6 +212,20 @@ def test_validator_on_the_localnet_netuid_over_mainnet_is_flagged():
     assert any("netuid=5" in w for w in warnings)
 
 
+def test_weight_writer_enable_is_localnet_only():
+    warnings = enforce(settings(enable_weight_writes=True), role="validator")
+    assert any("--set-weights-once" in warning for warning in warnings)
+    with pytest.raises(UnsafeConfiguration, match="local network"):
+        enforce(mainnet(enable_weight_writes=True), role="validator")
+
+
+def test_validator_rejects_an_untrusted_writer_spec_or_period():
+    with pytest.raises(ConfigError, match="specVersion 393"):
+        enforce(settings(expected_spec_version=394), role="validator")
+    with pytest.raises(ConfigError, match="power of two"):
+        enforce(settings(weight_period_blocks=7), role="validator")
+
+
 def test_that_flag_is_a_warning_not_a_refusal():
     # It is genuinely ambiguous — netuid 5 could one day be ours. Refusing
     # would be a guess; warning is not.
@@ -227,6 +258,27 @@ def test_platform_rejects_an_invalid_target_miner_hotkey():
 def test_initial_platform_is_localnet_only():
     with pytest.raises(UnsafeConfiguration, match="localnet plumbing"):
         enforce(mainnet(platform_miner_ss58=VALID_SS58), role="platform")
+
+
+def test_platform_requires_hashed_bearer_key_and_validator_accept_list():
+    with pytest.raises(ConfigError, match="INSTANT_PLATFORM_API_KEY_SHA256"):
+        enforce(settings(platform_miner_ss58=VALID_SS58), role="platform")
+    with pytest.raises(ConfigError, match="INSTANT_PLATFORM_VALIDATOR_SS58"):
+        enforce(
+            settings(
+                platform_miner_ss58=VALID_SS58,
+                platform_api_key_sha256="ab" * 32,
+            ),
+            role="platform",
+        )
+    enforce(
+        settings(
+            platform_miner_ss58=VALID_SS58,
+            platform_api_key_sha256="ab" * 32,
+            platform_validator_ss58=VALID_SS58,
+        ),
+        role="platform",
+    )
 
 
 def test_unknown_role_is_a_programming_error():

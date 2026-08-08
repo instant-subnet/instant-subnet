@@ -104,8 +104,14 @@ class VllmClient:
             r = await self._client.get("/v1/models", timeout=5.0)
             r.raise_for_status()
             return [m["id"] for m in r.json().get("data", [])]
-        except (httpx.HTTPError, KeyError, ValueError):
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
             return []
+
+    async def ready(self, expected_model: str) -> bool:
+        """The worker is healthy only when it advertises the configured model."""
+        if not await self.health():
+            return False
+        return expected_model in await self.models()
 
     async def complete(self, payload: dict[str, Any]) -> tuple[dict[str, Any], StreamOutcome]:
         """Non-streaming completion."""
@@ -122,7 +128,18 @@ class VllmClient:
         if r.status_code >= 400:
             raise UpstreamError(_extract_error(r), _client_or_server(r.status_code))
 
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError as exc:
+            raise UpstreamError("upstream returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise UpstreamError("upstream returned a non-object completion")
+        actual_model = data.get("model")
+        expected_model = body.get("model")
+        if actual_model != expected_model:
+            raise UpstreamError(
+                f"upstream served model {actual_model!r}, expected {expected_model!r}"
+            )
         usage = data.get("usage") or {}
         outcome = StreamOutcome(
             # Without streaming there is no first token to time, so TTFT is
@@ -183,6 +200,14 @@ class VllmClient:
                     if data == SSE_DONE:
                         break
 
+                    actual_model = _model_from_frame(data)
+                    expected_model = body.get("model")
+                    if actual_model is not None and actual_model != expected_model:
+                        raise UpstreamError(
+                            f"upstream served model {actual_model!r}, "
+                            f"expected {expected_model!r}"
+                        )
+
                     outcome.chunks += 1
                     outcome.assembled.extend(data.encode())
 
@@ -223,6 +248,15 @@ def _has_content(data: str) -> bool:
         if delta.get("tool_calls"):
             return True
     return False
+
+
+def _model_from_frame(data: str) -> str | None:
+    try:
+        parsed = json.loads(data)
+    except ValueError:
+        return None
+    model = parsed.get("model")
+    return model if isinstance(model, str) else None
 
 
 def _absorb_usage(data: str, outcome: StreamOutcome) -> None:

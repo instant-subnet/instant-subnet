@@ -250,6 +250,8 @@ class MinerStatsWindow(BaseModel):
     requests: int
     successes: int
     failures: int
+    clean_rejects: int = 0
+    served: int = 0
     ttft_p50_ms: int
     ttft_p95_ms: int
     tokens_per_s_p50: int

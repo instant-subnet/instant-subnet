@@ -137,16 +137,31 @@ class Settings:
     # Miner
     miner_host: str
     miner_port: int
+    miner_external_ip: str
     vllm_url: str
     max_concurrent: int
     platform_url: str
     platform_ss58: str
+
+    # Local/test mock OpenAI worker. This process is deliberately incapable of
+    # starting on Finney; see guards.enforce(role="mock").
+    mock_vllm_host: str
+    mock_vllm_port: int
+    mock_first_token_delay_ms: int
+    mock_token_delay_ms: int
 
     # Validator
     validator_host: str
     validator_port: int
     state_db: str
     metagraph_refresh_s: int
+    telemetry_max_age_s: int
+    telemetry_max_window_s: int
+    enable_weight_writes: bool
+    expected_spec_version: int
+    weight_mechanism_id: int
+    weight_version_key: int
+    weight_period_blocks: int
 
     # Platform gateway. The first plumbing release uses one explicitly
     # configured miner; metagraph-based routing is the next layer.
@@ -154,6 +169,11 @@ class Settings:
     platform_port: int
     platform_miner_url: str
     platform_miner_ss58: str
+    platform_miner_uid: int
+    platform_api_key_sha256: str
+    platform_state_db: str
+    platform_validator_ss58: str
+    platform_stats_window_s: int
     request_timeout_s: int
 
     # Safety flags. Every one of these is checked against ``network`` in
@@ -228,20 +248,41 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         wallet_path=_env("INSTANT_WALLET_PATH", "~/.bittensor/wallets"),
         miner_host=_env("INSTANT_MINER_HOST", "0.0.0.0"),
         miner_port=_env_int("INSTANT_MINER_PORT", 8091),
+        miner_external_ip=_env("INSTANT_MINER_EXTERNAL_IP", ""),
         vllm_url=_env("INSTANT_VLLM_URL", "http://127.0.0.1:8000"),
         max_concurrent=_env_int("INSTANT_MAX_CONCURRENT", 16),
         platform_url=_env("INSTANT_PLATFORM_URL", "http://127.0.0.1:8090"),
         platform_ss58=_env("INSTANT_PLATFORM_SS58", ""),
+        mock_vllm_host=_env("INSTANT_MOCK_VLLM_HOST", "127.0.0.1"),
+        mock_vllm_port=_env_int("INSTANT_MOCK_VLLM_PORT", 8000),
+        mock_first_token_delay_ms=_env_int(
+            "INSTANT_MOCK_FIRST_TOKEN_DELAY_MS", 50
+        ),
+        mock_token_delay_ms=_env_int("INSTANT_MOCK_TOKEN_DELAY_MS", 10),
         validator_host=_env("INSTANT_VALIDATOR_HOST", "127.0.0.1"),
         validator_port=_env_int("INSTANT_VALIDATOR_PORT", 8092),
         state_db=_env("INSTANT_STATE_DB", "./validator_state.sqlite3"),
         metagraph_refresh_s=_env_int("INSTANT_METAGRAPH_REFRESH_S", 120),
+        telemetry_max_age_s=_env_int("INSTANT_TELEMETRY_MAX_AGE_S", 120),
+        telemetry_max_window_s=_env_int("INSTANT_TELEMETRY_MAX_WINDOW_S", 7200),
+        enable_weight_writes=_env_bool("INSTANT_ENABLE_WEIGHT_WRITES", False),
+        expected_spec_version=_env_int("INSTANT_EXPECTED_SPEC_VERSION", 393),
+        weight_mechanism_id=_env_int("INSTANT_WEIGHT_MECHANISM_ID", 0),
+        weight_version_key=_env_int("INSTANT_WEIGHT_VERSION_KEY", 0),
+        weight_period_blocks=_env_int("INSTANT_WEIGHT_PERIOD_BLOCKS", 8),
         platform_host=_env("INSTANT_PLATFORM_HOST", "127.0.0.1"),
         platform_port=_env_int("INSTANT_PLATFORM_PORT", 8090),
         platform_miner_url=_env(
             "INSTANT_PLATFORM_MINER_URL", "http://127.0.0.1:8091"
         ),
         platform_miner_ss58=_env("INSTANT_PLATFORM_MINER_SS58", ""),
+        platform_miner_uid=_env_int("INSTANT_PLATFORM_MINER_UID", 0),
+        platform_api_key_sha256=_env("INSTANT_PLATFORM_API_KEY_SHA256", ""),
+        platform_state_db=_env(
+            "INSTANT_PLATFORM_STATE_DB", "./platform_state.sqlite3"
+        ),
+        platform_validator_ss58=_env("INSTANT_PLATFORM_VALIDATOR_SS58", ""),
+        platform_stats_window_s=_env_int("INSTANT_PLATFORM_STATS_WINDOW_S", 3600),
         request_timeout_s=_env_int("INSTANT_REQUEST_TIMEOUT_S", 30),
         attestation_mode=attestation_mode,
         allow_gpu_reuse=_env_bool("INSTANT_ALLOW_GPU_REUSE", False),

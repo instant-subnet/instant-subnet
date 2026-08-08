@@ -16,9 +16,11 @@ step over every one of them.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
+import httpx
 import pytest
 from fake_vllm import FakeVllm
 from fastapi.testclient import TestClient
@@ -152,6 +154,13 @@ def test_health_reports_loading_before_weights_are_resident(client, fake):
     assert body["ready"] is False
     # Young process, upstream not up yet: still loading, not broken.
     assert body["status"] == "loading"
+
+
+def test_health_is_not_ready_when_upstream_advertises_a_different_model(client, fake):
+    fake.model_id = "wrong-model"
+    body = client.get("/health").json()
+    assert body["ready"] is False
+    assert body["model_id"] == MODEL
 
 
 def test_health_is_degraded_when_the_accept_list_is_stale(client, ctx):
@@ -414,6 +423,21 @@ def test_in_flight_returns_to_zero_after_a_failure(
     assert ctx.in_flight == 0
 
 
+def test_upstream_model_substitution_is_a_502_without_a_receipt(
+    client, platform_key, miner_key, fake
+):
+    fake.model_id = "wrong-model"
+    body = body_for()
+    response = client.post(
+        "/v1/chat/completions",
+        content=body,
+        headers=signed(platform_key, body, to=miner_key.ss58_address),
+    )
+    assert response.status_code == 502
+    assert "served model" in response.json()["detail"]
+    assert receipts.H_RECEIPT not in response.headers
+
+
 # --------------------------------------------------------------------------
 # Streaming inference
 # --------------------------------------------------------------------------
@@ -443,6 +467,21 @@ def test_stream_ends_with_a_verifiable_receipt(client, platform_key, miner_key, 
         response_body=assembled_from_sse(text),
     )
     assert signed_receipt.receipt.completion_tokens == fake.completion_tokens
+
+
+def test_stream_model_substitution_emits_error_and_no_receipt(
+    client, platform_key, miner_key, fake
+):
+    fake.model_id = "wrong-model"
+    body = body_for(stream=True)
+    response = client.post(
+        "/v1/chat/completions",
+        content=body,
+        headers=signed(platform_key, body, to=miner_key.ss58_address),
+    )
+    names = [name for name, _ in sse_events(response.text)]
+    assert names == ["error"]
+    assert receipts.SSE_RECEIPT_EVENT not in names
 
 
 def test_the_miner_asks_the_upstream_for_a_usage_frame(
@@ -517,6 +556,38 @@ def test_in_flight_returns_to_zero_after_a_stream(client, ctx, platform_key, min
         headers=signed(platform_key, body, to=miner_key.ss58_address),
     ) as r:
         list(r.iter_text())
+    assert ctx.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_capacity_is_reserved_before_the_iterator_runs(
+    ctx, fake, platform_key, miner_key
+):
+    ctx.max_concurrent = 1
+    fake.pre_content_delay_s = 0.1
+    app = create_app(ctx)
+    body_one = body_for(stream=True, seed=1)
+    body_two = body_for(stream=True, seed=2)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://miner"
+    ) as http:
+        first = asyncio.create_task(
+            http.post(
+                "/v1/chat/completions",
+                content=body_one,
+                headers=signed(platform_key, body_one, to=miner_key.ss58_address),
+            )
+        )
+        await asyncio.sleep(0.01)
+        second = await http.post(
+            "/v1/chat/completions",
+            content=body_two,
+            headers=signed(platform_key, body_two, to=miner_key.ss58_address),
+        )
+        first_response = await first
+    await ctx.vllm.aclose()
+    assert first_response.status_code == 200
+    assert second.status_code == 429
     assert ctx.in_flight == 0
 
 

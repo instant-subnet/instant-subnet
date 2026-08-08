@@ -9,7 +9,8 @@ Startup order is deliberate:
 1. Load and **validate** settings. If a development flag is set on mainnet,
    the process dies here — before a key is loaded, before a socket is opened,
    before anything is announced on chain.
-2. Load the wallet and confirm the hotkey is registered on our netuid.
+2. Load the hotkey and public coldkey identity, confirm the hotkey is registered
+   on our netuid, and cross-check its metagraph owner.
 3. Sync the metagraph once, so the accept-list is populated before the
    listener starts. A miner that starts serving with an empty accept-list
    rejects every request and looks broken.
@@ -35,6 +36,7 @@ import uvicorn
 from ..common.config import Settings, load_settings
 from ..common.guards import UnsafeConfiguration, describe, enforce
 from ..protocol.epistula import ReplayGuard
+from ..protocol.ss58 import is_valid
 from .app import MinerContext, create_app
 from .attest import (
     AttestationCache,
@@ -47,6 +49,16 @@ from .auth import AcceptList, Authenticator
 from .upstream import VllmClient
 
 log = logging.getLogger("instant.miner")
+
+_COLDKEYPUB_REMEDIATION = (
+    "Deploy ONLY coldkeypub.txt from the wallet that registered this hotkey; "
+    "never deploy the private coldkey, mnemonic, or seed to the miner"
+)
+
+
+class WalletPreflightError(RuntimeError):
+    """The deployed wallet lacks the public identity needed to serve an axon."""
+
 
 def build_context(settings: Settings, wallet, metagraph) -> MinerContext:
     """Assemble the miner from validated settings and chain objects."""
@@ -90,6 +102,7 @@ def build_context(settings: Settings, wallet, metagraph) -> MinerContext:
         image_digest=idg,
     )
 
+
 def _validator_hotkeys(metagraph) -> frozenset[str]:
     """Hotkeys holding a validator permit.
 
@@ -98,10 +111,77 @@ def _validator_hotkeys(metagraph) -> frozenset[str]:
     maintaining our own copy of a rule that already exists and can change.
     """
     out = set()
-    for uid, permit in enumerate(metagraph.validator_permit):
+    for hotkey, permit in zip(
+        metagraph.hotkeys, metagraph.validator_permit, strict=False
+    ):
         if permit:
-            out.add(metagraph.hotkeys[uid])
+            out.add(hotkey)
     return frozenset(out)
+
+
+def _preflight_coldkeypub(wallet, metagraph, hotkey_ss58: str) -> str:
+    """Load the public coldkey and cross-check the registered owner.
+
+    Bittensor 9.12.2 signs the serve extrinsic with the hotkey but still reads
+    ``wallet.coldkeypub.ss58_address`` into the call parameters. A miner host
+    therefore needs the public ``coldkeypub.txt`` file, never the private
+    ``coldkey`` file.
+    """
+    try:
+        keyfile = wallet.coldkeypub_file
+        path = str(keyfile.path)
+    except Exception as exc:  # noqa: BLE001 - third-party wallet boundary
+        raise WalletPreflightError(
+            f"cannot resolve the public coldkey file: {exc}. "
+            f"{_COLDKEYPUB_REMEDIATION}"
+        ) from exc
+
+    try:
+        exists = keyfile.exists_on_device()
+        readable = keyfile.is_readable() if exists else False
+    except Exception as exc:  # noqa: BLE001 - third-party keyfile boundary
+        raise WalletPreflightError(
+            f"cannot inspect public coldkey file {path}: {exc}. "
+            f"{_COLDKEYPUB_REMEDIATION}"
+        ) from exc
+    if not exists or not readable:
+        state = "missing" if not exists else "not readable by the service user"
+        raise WalletPreflightError(
+            f"public coldkey file {path} is {state}. Bittensor 9.12.2 requires "
+            f"coldkeypub.txt to announce an axon. {_COLDKEYPUB_REMEDIATION}"
+        )
+
+    try:
+        coldkey_ss58 = str(wallet.coldkeypub.ss58_address)
+    except Exception as exc:  # noqa: BLE001 - third-party wallet boundary
+        raise WalletPreflightError(
+            f"cannot read public coldkey identity from {path}: {exc}. "
+            f"{_COLDKEYPUB_REMEDIATION}"
+        ) from exc
+    if not is_valid(coldkey_ss58):
+        raise WalletPreflightError(
+            f"public coldkey identity in {path} is not a valid Bittensor SS58 "
+            f"address. {_COLDKEYPUB_REMEDIATION}"
+        )
+
+    uid = list(metagraph.hotkeys).index(hotkey_ss58)
+    owners = list(getattr(metagraph, "coldkeys", []))
+    if uid < len(owners):
+        registered_owner = str(owners[uid])
+        if registered_owner and coldkey_ss58 != registered_owner:
+            raise WalletPreflightError(
+                f"public coldkey {coldkey_ss58} in {path} does not own registered "
+                f"hotkey {hotkey_ss58}; the metagraph owner is {registered_owner}. "
+                f"{_COLDKEYPUB_REMEDIATION}"
+            )
+    else:
+        log.warning(
+            "metagraph did not expose a coldkey owner for uid %d; loaded public "
+            "coldkey %s but could not cross-check it",
+            uid,
+            coldkey_ss58,
+        )
+    return coldkey_ss58
 
 
 async def _refresh_loop(
@@ -135,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check-chain",
         action="store_true",
-        help="connect to the chain, verify registration, and exit",
+        help="verify wallet public identity and chain registration, then exit",
     )
     args = parser.parse_args(argv)
 
@@ -180,15 +260,24 @@ def main(argv: list[str] | None = None) -> int:
     if wallet.hotkey.ss58_address not in metagraph.hotkeys:
         log.error(
             "hotkey %s is not registered on netuid %d (%s). Register it with "
-            "`btcli subnet register` before starting the miner.",
+            "`btcli subnets register` before starting the miner.",
             wallet.hotkey.ss58_address, settings.netuid, settings.chain_endpoint,
         )
         return 3
 
+    try:
+        coldkeypub_ss58 = _preflight_coldkeypub(
+            wallet, metagraph, wallet.hotkey.ss58_address
+        )
+    except WalletPreflightError as exc:
+        log.error("miner wallet preflight failed: %s", exc)
+        return 3
+
     if args.check_chain:
         log.info(
-            "chain check passed: hotkey=%s netuid=%d neurons=%d",
+            "chain check passed: hotkey=%s coldkeypub=%s netuid=%d neurons=%d",
             wallet.hotkey.ss58_address,
+            coldkeypub_ss58,
             settings.netuid,
             len(metagraph.hotkeys),
         )
@@ -204,10 +293,24 @@ def main(argv: list[str] | None = None) -> int:
     # metagraph rather than being told out of band.
     try:
         axon = bt.axon(
-            wallet=wallet, port=settings.miner_port, external_port=settings.miner_port
+            wallet=wallet,
+            port=settings.miner_port,
+            external_ip=settings.miner_external_ip or None,
+            external_port=settings.miner_port,
         )
-        axon.serve(netuid=settings.netuid, subtensor=subtensor)
-        log.info("axon announced on port %d", settings.miner_port)
+        announced = subtensor.serve_axon(netuid=settings.netuid, axon=axon)
+        if not announced:
+            log.error(
+                "axon announcement was rejected for %s:%d",
+                settings.miner_external_ip or "auto-detected-ip",
+                settings.miner_port,
+            )
+            return 4
+        log.info(
+            "axon announced on %s:%d",
+            settings.miner_external_ip or "auto-detected-ip",
+            settings.miner_port,
+        )
     except Exception as exc:  # noqa: BLE001
         log.error("failed to announce axon: %s", exc)
         return 4

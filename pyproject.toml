@@ -61,6 +61,7 @@ dev = [
 instant-miner = "instant.miner.main:main"
 instant-validator = "instant.validator.main:main"
 instant-platform = "instant.platform.main:main"
+instant-mock-vllm = "instant.mock_vllm.main:main"
 
 [tool.setuptools.packages.find]
 include = ["instant*"]

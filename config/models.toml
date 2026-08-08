@@ -11,6 +11,17 @@
 # Tier 1 is the same family as production, so the gap between them is size,
 # not behaviour.
 
+[mock]
+# Socket-level plumbing on a CPU droplet. The model id is intentionally not a
+# real model name: telemetry and manifests must never claim that deterministic
+# fixture output came from GPT-OSS.
+model_id       = "instant/mock-echo"
+max_model_len  = 8192
+min_vram_gb    = 0
+cpu_ok         = true
+attestation    = "off"
+served_by      = "mock"
+
 [dev0]
 # Protocol plumbing. CPU only, no GPU anywhere in the loop, runs in CI and
 # on a laptop. Attestation is stubbed here and only here.

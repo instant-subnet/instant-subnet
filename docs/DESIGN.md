@@ -106,15 +106,16 @@ Miner (Python/FastAPI) ──► vLLM
   │ signed receipt
   └────────────────────────► platform telemetry
 
-Validator (Python, read-only chain loop implemented)
+Validator (Python; continuous loop is read-only)
   ├─ metagraph discovery ───► subtensor
-  ├─ direct/shadow probes ──► future build layer
-  ├─ receipt/stat audits ───► future build layer
-  └─ set_weights ───────────► future bounded writer
+  ├─ bounded direct probes ─► receipt-verified observations
+  ├─ signed platform stats ─► SQLite ─► deterministic scorer
+  └─ explicit localnet CLI ──► one-attempt set_mechanism_weights
 ```
 
-The chain holds registration, validator permits, weights, and emissions. It is not
-modified by this project.
+The chain holds registration, validator permits, weights, and emissions. Validator
+startup and its PM2 loop never modify it. The only validator mutation path is a
+separately invoked, default-disabled localnet one-shot with fail-closed preflights.
 
 ### 3.1 Routing decision
 
@@ -197,10 +198,7 @@ diagnostic only; observer timings drive scoring.
 The miner refreshes validator permits from the metagraph and announces its axon through
 the Bittensor SDK. The only runtime `import bittensor` is lazy in the miner entrypoint.
 
-## 6. Planned platform and validator surfaces
-
-These contracts remain architectural intent and will be finalized when their code is
-written.
+## 6. Platform and validator surfaces
 
 ### 6.1 User-facing platform
 
@@ -208,9 +206,10 @@ written.
 - `GET /v1/models`
 - `GET /health`
 
-The gateway authenticates an API key, applies quota/rate limits, selects an attested
-healthy miner, signs the miner request, relays SSE without buffering, verifies the final
-receipt, and records usage.
+The local/test gateway authenticates a Bearer key by a configured SHA-256 digest, routes
+to one configured miner, signs the miner request, relays SSE without buffering, verifies
+the final receipt, and records externally observed timing and reliability in SQLite.
+Quota/rate limits and dynamic attested-miner selection remain planned.
 
 ### 6.2 Miner-facing platform
 
@@ -221,9 +220,10 @@ receipt, and records usage.
 
 ### 6.3 Validator-facing platform
 
-- live miner/routing view
-- aggregate stats backed by receipt counts and digests
-- raw receipt sampling/audit path
+- Epistula-authenticated `GET /validator/v1/stats`
+- rolling aggregates backed by verified receipt counts and a receipt Merkle root
+- exact-byte Epistula signature by the platform over each stats response
+- raw receipt sampling/audit path (planned)
 - shadow challenge injection
 - cached attestation retrieval
 
@@ -300,6 +300,19 @@ not UID, because UIDs are recycled.
 
 Gate details include at least 20 successful probes, two misses before gate-out, and a
 one-epoch cooldown. Exact values in `config/scoring.toml` are authoritative.
+
+The first scoring coordinator is an operator-invoked one-shot. It authenticates the
+platform's exact response bytes with Epistula, requires an explicit validator recipient,
+checks freshness/count invariants and the current `(uid, hotkey)` roster, persists the
+window, and commits a logical epoch at most once. Platform telemetry never satisfies the
+probe-count gate.
+
+The localnet writer is off by default and has no scheduler. It pins spec version 393,
+mechanism 0, and the configured weights version key; requires registration, stake, a
+validator permit, stable UID mapping, rate/min/max compliance, and a nonzero canonical
+u16 vector; composes `set_mechanism_weights` directly; submits exactly once with the
+hotkey; waits for finalization; and verifies both weight readback and `LastUpdate`. It
+does not call Bittensor 9.12.2's high-level `set_weights` retry loop.
 
 ## 9. Chain and network configuration
 
@@ -389,7 +402,7 @@ instant-subnet/
 │   ├── miner/        working FastAPI miner and Bittensor entrypoint
 │   ├── validator/    chain observer/API plus deterministic scoring and SQLite state
 │   └── platform/     localnet-only single-miner signed gateway
-├── tests/            417 tests
+├── tests/            protocol, runtime, deployment, and failure-mode tests
 └── pyproject.toml
 ```
 
@@ -404,16 +417,23 @@ Implemented and tested:
 - deterministic scoring, EMA, gates, penalties, u16 normalization;
 - validator SQLite migrations and epoch persistence;
 - validator read-only metagraph loop with liveness/readiness/miner discovery APIs;
+- bounded Epistula-signed direct probe batches with exact receipt verification;
+- authenticated platform telemetry ingestion, deterministic one-shot scoring, and
+  telemetry/scoring/weight operations status;
+- a default-disabled, spec-393-pinned localnet weight writer with exactly one attempt,
+  finalized readback, and crash reconciliation;
 - single-miner platform relay with exact-byte Epistula signing and streaming receipt
-  preservation; and
+  preservation;
+- Bearer-authenticated OpenAI routes, durable platform telemetry, receipt verification,
+  and signed validator statistics;
+- runnable local/test mock inference worker with delayed streaming; and
 - role env examples, PM2 process definitions, README, and test workflow.
 
 Not implemented:
 
-- validator probes, attestation verification orchestration, telemetry ingestion,
-  scoring epoch orchestration, and bounded weight submission;
-- platform API keys, database, dynamic routing, quotas, receipt verification/storage,
-  telemetry, and dashboard API;
+- validator shadow probes, attestation verification orchestration, raw receipt auditing,
+  and an automatic production epoch scheduler;
+- platform dynamic routing, quotas, raw receipt sampling, and dashboard API;
 - pinned GPU/vLLM deployment, attestation lockfiles, host bootstrap automation, and the
   full four-way smoke test.
 
@@ -439,7 +459,7 @@ Current infrastructure:
 
 - OCI Ampere A1 at `129.80.21.251`: static platform site behind nginx and Cloudflare.
 - DigitalOcean at `68.183.141.180`: shared Bittensor localnet.
-- Miner and validator deployment hosts: not yet provisioned.
+- CPU mock-plumbing miner at `165.227.197.158`; production GPU host remains unselected.
 - Confidential GPU capacity: Azure NCCadsH100v5 quota remains the production hardware
   critical path.
 

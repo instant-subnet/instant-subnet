@@ -24,9 +24,12 @@ copied into this public repository and their status has not been re-verified her
 - [ ] Select a vLLM-supported GPU/image for `openai/gpt-oss-20b`; do not provision
       the previously considered Ada SKU on VRAM alone.
 - [ ] Provision one GPU miner host and one validator host.
+- [x] Provision CPU miner plumbing host `165.227.197.158` for the explicit mock tier.
 - [ ] Retire the exposed plaintext-export validator hotkey; create/register a fresh
       dedicated validator hotkey instead of copying that file to a host.
-- [ ] Select and record one miner hotkey from the `miner` wallet.
+- [ ] Create and register a fresh miner hotkey from a securely held wallet; deploy only
+      its operational hotkey and the owner's public `coldkeypub.txt` to the miner, never
+      the private coldkey, mnemonic, or seed.
 - [ ] Fund the `validator` coldkey from Alice.
 - [ ] Register the miner and validator; record both UIDs.
 - [ ] Stake the validator.
@@ -39,7 +42,9 @@ copied into this public repository and their status has not been re-verified her
 1. Validate the exact GPU image against the official GPT-OSS/vLLM recipe, then create
    the miner and validator instances.
 2. Install this repository into a fresh Python 3.11 venv on each host.
-3. Put only the role-specific wallet on each host and fill its `.env.<role>` file.
+3. Put only the role-specific runtime keys on each host and fill its `.env.<role>` file.
+   The miner gets its fresh hotkey and public `coldkeypub.txt`, never the private
+   coldkey, mnemonic, or seed.
 4. Run the configuration and chain preflights in `README.md`.
 5. Start vLLM, then the miner, platform, and single PM2 validator process.
 6. Require `/readyz` and one full chat completion through the platform before adding
@@ -50,18 +55,24 @@ Do not run another subnet-creation command: netuid 5 already exists.
 ## Buildout after the chain gate
 
 - [x] Build the localnet-only, single-miner Python/FastAPI platform gateway.
-- [ ] Implement gateway API keys, dynamic routing, rate limits, and quotas.
-- [ ] Implement gateway receipt verification, storage, telemetry, and audit endpoints.
+- [x] Implement a single hashed Bearer API key for the local/test gateway.
+- [ ] Implement dynamic routing, rate limits, quotas, and key lifecycle.
+- [x] Implement gateway receipt verification, SQLite storage, telemetry, and signed stats.
+- [ ] Implement raw receipt sampling and dashboard audit endpoints.
 - [x] Implement exact-byte Epistula platform-to-miner signing and streaming relay.
 - [x] Implement miner localnet connection, registration check, and axon announcement.
 - [ ] Deploy and smoke-test the miner against the platform and localnet.
-- [ ] Implement validator `probe.py` for direct and shadow probes.
+- [x] Implement bounded, receipt-verified direct validator probes; platform-shaped
+      shadow probes remain open.
 - [ ] Implement validator attestation verification orchestration.
-- [ ] Implement validator platform client and telemetry/receipt auditing.
-- [ ] Implement validator `weights.py` with retry and explicit result checking.
+- [x] Implement the validator's Epistula-authenticated platform stats client and
+      telemetry persistence; raw receipt sampling remains open.
+- [x] Implement the default-disabled localnet `weights.py` with a bounded single
+      attempt, explicit result checking, and finalized chain readback.
 - [x] Implement the read-only validator metagraph loop, local operations API, and
       executable entry point.
-- [ ] Implement validator scoring-epoch orchestration.
+- [x] Implement explicit, idempotent `--score-once` orchestration; periodic production
+      epoch scheduling remains open.
 - [ ] Run the four-way miner/validator/chain/platform smoke test.
 - [ ] Exercise component failure modes before production deployment.
 
@@ -74,7 +85,8 @@ Do not run another subnet-creation command: netuid 5 already exists.
 - [ ] Add `WEIGHTS.lock` and `IMAGES.lock` before enabling hard attestation.
 - [x] Add per-role env examples with explicit localnet configuration.
 - [x] Add single-process PM2 definitions for miner, validator, and gateway.
-- [ ] Add a pinned/reboot-safe vLLM process definition after the GPU image is selected.
+- [x] Add a reboot-safe PM2 definition for the local/test mock inference worker.
+- [ ] Add a pinned/reboot-safe real vLLM definition after the GPU image is selected.
 - [ ] Add DigitalOcean and OCI bootstrap/deploy scripts.
 - [x] Fix active configuration documentation to use netuid 5 and port 80.
 - [ ] Decide whether `INSTANT_NETUID` should remain defaulted in code or become required.

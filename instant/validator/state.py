@@ -501,6 +501,16 @@ class ValidatorState:
             "SELECT * FROM weight_sets ORDER BY epoch DESC LIMIT 1"
         ).fetchone()
 
+    def weight_set_for_epoch(self, epoch: int) -> sqlite3.Row | None:
+        """Return an epoch's attempt record, including failed attempts.
+
+        A failed chain response is still an attempt.  The one-shot writer
+        uses this lookup to refuse a duplicate submission after restart.
+        """
+        return self._db.execute(
+            "SELECT * FROM weight_sets WHERE epoch = ?", (epoch,)
+        ).fetchone()
+
     def scores_for_epoch(self, epoch: int) -> list[dict[str, Any]]:
         """What ``/scores`` serves. Ordered by uid so the output is stable."""
         return [
@@ -513,6 +523,32 @@ class ValidatorState:
     def latest_epoch(self) -> int | None:
         row = self._db.execute("SELECT MAX(epoch) AS e FROM scores").fetchone()
         return None if row is None else row["e"]
+
+    def latest_telemetry_epoch(self) -> int | None:
+        row = self._db.execute("SELECT MAX(epoch) AS e FROM telemetry").fetchone()
+        return None if row is None else row["e"]
+
+    def telemetry_for_epoch(self, epoch: int) -> list[dict[str, Any]]:
+        """Return persisted platform rows ordered by UID for operations APIs."""
+        return [
+            dict(row)
+            for row in self._db.execute(
+                "SELECT * FROM telemetry WHERE epoch = ? ORDER BY uid", (epoch,)
+            )
+        ]
+
+    def probe_summary(self, epoch: int, *, source: ProbeSource) -> dict[str, int]:
+        """Return bounded-batch counts for operations status and idempotent runs."""
+        row = self._db.execute(
+            "SELECT COUNT(*) AS attempts, "
+            "SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successes "
+            "FROM probes WHERE epoch = ? AND source = ?",
+            (epoch, source),
+        ).fetchone()
+        return {
+            "attempts": int(row["attempts"] or 0),
+            "successes": int(row["successes"] or 0),
+        }
 
     # --- housekeeping -------------------------------------------------------
 

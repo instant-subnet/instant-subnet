@@ -112,6 +112,9 @@ async def test_operations_api_separates_liveness_from_readiness(validator_key):
         assert (await client.get("/health")).json()["registered"] is False
         assert (await client.get("/miners")).json()["miners"] == []
         assert (await client.get("/scores")).json() == {"epoch": None, "scores": []}
+        assert (await client.get("/telemetry")).json()["status"]["status"] == "not_run"
+        assert (await client.get("/scoring")).json()["scores"] == []
+        assert (await client.get("/weights")).json() == {"last_attempt": None}
     await runtime.aclose()
     await http.aclose()
 
