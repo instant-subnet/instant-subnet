@@ -162,7 +162,11 @@ def test_exact_spec393_call_is_hotkey_signed_once_and_read_back(
         }
     ]
     row = state.weight_set_for_epoch(123)
-    assert (row["ok"], row["attempts"], row["config_version"]) == (1, 1, 1)
+    assert (row["ok"], row["attempts"], row["config_version"]) == (
+        1,
+        1,
+        config.version,
+    )
 
 
 def test_unsuccessful_extrinsic_is_not_retried_and_blocks_duplicate_epoch(

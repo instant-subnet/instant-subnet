@@ -13,7 +13,7 @@
 # weight vectors rather than nearly-identical ones.
 
 [version]
-id = 1
+id = 2
 
 [weights]
 # The §8.1 formula:
@@ -95,7 +95,11 @@ ema_alpha_bps = 3000
 direct_interval_s     = 60
 shadow_interval_s     = 30
 timeout_s             = 30
-max_concurrent_probes = 16
+# Direct probes measure latency, throughput, and reliability. They are
+# sequential so a one-slot inference worker is not penalized for honestly
+# enforcing its advertised capacity; demonstrated concurrency comes from
+# platform telemetry instead.
+max_concurrent_probes = 1
 max_tokens            = 256
 
 # Every probe prompt is prefixed with a random 16-byte nonce so no two
