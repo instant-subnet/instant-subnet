@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from ..protocol import receipts
 from ..protocol.epistula import (
@@ -165,7 +166,13 @@ def create_app(ctx: PlatformContext) -> FastAPI:
         request_id = str(uuid.uuid4())
         started_ms = _now_ms()
         started_perf = time.perf_counter()
-        ctx.state.begin(
+        # Every PlatformState call commits to SQLite and is therefore blocking.
+        # Measured on the OCI platform host, one committed write costs 2.5ms with
+        # the connection's default synchronous=FULL, against 0.08ms for a thread
+        # hop -- so calling these inline stalls the loop relaying every other
+        # in-flight stream. Offload each one.
+        await run_in_threadpool(
+            ctx.state.begin,
             request_id=request_id,
             miner_hotkey=ctx.miner_ss58,
             started_ms=started_ms,
@@ -186,7 +193,8 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                 upstream = await ctx.http.post(url, content=raw, headers=headers)
             except httpx.HTTPError as exc:
                 elapsed_ms = _elapsed_ms(started_perf)
-                ctx.state.finish(
+                await run_in_threadpool(
+                    ctx.state.finish,
                     request_id=request_id,
                     finished_ms=_now_ms(),
                     status_code=None,
@@ -202,7 +210,8 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             )
             success = 200 <= upstream.status_code < 300 and evidence.verified
             receipt = evidence.signed_receipt if evidence.verified else None
-            ctx.state.finish(
+            await run_in_threadpool(
+                ctx.state.finish,
                 request_id=request_id,
                 finished_ms=_now_ms(),
                 status_code=upstream.status_code,
@@ -229,7 +238,8 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             upstream = await ctx.http.send(outgoing, stream=True)
         except httpx.HTTPError as exc:
             elapsed_ms = _elapsed_ms(started_perf)
-            ctx.state.finish(
+            await run_in_threadpool(
+                ctx.state.finish,
                 request_id=request_id,
                 finished_ms=_now_ms(),
                 status_code=None,
@@ -244,7 +254,8 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             media_type = _media_type(upstream, "application/json")
             await upstream.aclose()
             elapsed_ms = _elapsed_ms(started_perf)
-            ctx.state.finish(
+            await run_in_threadpool(
+                ctx.state.finish,
                 request_id=request_id,
                 finished_ms=_now_ms(),
                 status_code=upstream.status_code,
@@ -298,7 +309,8 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                         if receipt and ttft_ms is not None
                         else None
                     )
-                    ctx.state.finish(
+                    await run_in_threadpool(
+                        ctx.state.finish,
                         request_id=request_id,
                         finished_ms=finished_ms,
                         status_code=upstream.status_code,
@@ -349,7 +361,12 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             return _error(401, "unauthorized", exc.reason)
 
         generated_at_ms = _now_ms()
-        stats = ctx.state.stats(
+        # The costliest state call by far: it holds the lock across every row in
+        # the window, parses each stored receipt, and verifies signatures to build
+        # a merkle root. Unlike begin/finish this is O(window), so inline it would
+        # stall streaming relays for as long as the window is large.
+        stats = await run_in_threadpool(
+            ctx.state.stats,
             miner_hotkey=ctx.miner_ss58,
             miner_uid=ctx.miner_uid,
             window_start_ms=generated_at_ms - ctx.stats_window_s * 1000,
