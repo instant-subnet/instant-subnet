@@ -294,6 +294,92 @@ def test_invalid_request_is_rejected_before_it_reaches_the_miner(client, miner_a
     assert miner_app.state.requests == []
 
 
+def test_public_stats_is_readable_without_a_signature(client):
+    # The metrics page is a browser with no key and no wallet. If this needs
+    # credentials, the page has no data source at all.
+    response = client.get("/public/v1/stats", headers={"authorization": ""})
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+
+    payload = response.json()
+    assert payload["miners"][0]["uid"] == 7
+    assert "receipt_merkle_root" not in payload
+    assert "block_start" not in payload
+    assert "hotkey" not in payload["miners"][0]
+
+
+def test_public_stats_agrees_with_the_signed_validator_response(
+    client, validator_key, platform_key
+):
+    client.post(
+        "/v1/chat/completions",
+        content=body_for(),
+        headers={"content-type": "application/json"},
+    )
+    payload = client.get("/public/v1/stats", headers={"authorization": ""}).json()
+    assert payload["miners"][0]["successes"] == 1
+    assert payload["total_requests"] == 1
+
+    # Same window, same aggregation, so the page can never quietly disagree
+    # with what the validator is scoring on.
+    signed = _stats(client, validator_key, platform_key).json()["miners"][0]
+    assert payload["miners"][0]["requests"] == signed["requests"]
+    assert payload["miners"][0]["tokens_per_s_p50"] == signed["tokens_per_s_p50"]
+
+
+def test_public_stats_is_cached_so_readers_cannot_amplify_the_query(
+    miner_app, miner_key, platform_key, validator_key, tmp_path
+):
+    # A long TTL rather than the default, so the assertion is about caching
+    # and not about whether this test ran inside ten seconds.
+    ctx = platform_context(
+        miner_app, miner_key, platform_key, validator_key, tmp_path / "cached.sqlite3"
+    )
+    ctx.public_stats_ttl_s = 3600.0
+    with TestClient(create_app(ctx)) as cached_client:
+        cached_client.headers.update(AUTH)
+        first = cached_client.get("/public/v1/stats", headers={"authorization": ""})
+        cached_client.post(
+            "/v1/chat/completions",
+            content=body_for(),
+            headers={"content-type": "application/json"},
+        )
+        second = cached_client.get("/public/v1/stats", headers={"authorization": ""})
+
+    # Within the TTL the second reader gets the first reader's bytes. That is
+    # the trade being made: a page polling every 10s costs one stats() call
+    # per 10s no matter how many tabs are open, at the price of showing a
+    # request up to a TTL late.
+    assert first.content == second.content
+
+
+def test_public_stats_recomputes_once_the_ttl_lapses(
+    miner_app, miner_key, platform_key, validator_key, tmp_path
+):
+    ctx = platform_context(
+        miner_app, miner_key, platform_key, validator_key, tmp_path / "uncached.sqlite3"
+    )
+    ctx.public_stats_ttl_s = 0.0
+    with TestClient(create_app(ctx)) as fresh_client:
+        fresh_client.headers.update(AUTH)
+        before = fresh_client.get("/public/v1/stats", headers={"authorization": ""})
+        fresh_client.post(
+            "/v1/chat/completions",
+            content=body_for(),
+            headers={"content-type": "application/json"},
+        )
+        after = fresh_client.get("/public/v1/stats", headers={"authorization": ""})
+
+    assert before.json()["total_requests"] == 0
+    assert after.json()["total_requests"] == 1
+
+
+def test_public_stats_does_not_weaken_the_validator_route(client, validator_key):
+    assert client.get("/validator/v1/stats").status_code == 401
+    signed = _stats(client, validator_key, validator_key)
+    assert signed.status_code == 401
+
+
 def _stats(client: TestClient, validator_key, platform_key) -> httpx.Response:
     return client.get(
         "/validator/v1/stats",

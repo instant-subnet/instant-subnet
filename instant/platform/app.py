@@ -26,6 +26,7 @@ from ..protocol.epistula import (
 from ..protocol.keys import Signer
 from ..protocol.schemas import ChatCompletionRequest
 from ..protocol.ss58 import is_valid
+from . import public
 from .state import PlatformState
 
 _FORWARDED_RESPONSE_HEADERS = {
@@ -48,6 +49,9 @@ class PlatformContext:
     validator_hotkeys: frozenset[str]
     miner_uid: int = 0
     stats_window_s: int = 3600
+    # How long one computed public stats body is reused. Injectable so tests
+    # can pin it rather than racing a ten-second wall clock.
+    public_stats_ttl_s: float = public.DEFAULT_TTL_S
     validator_replay: ReplayGuard = field(default_factory=ReplayGuard)
 
     def __post_init__(self) -> None:
@@ -63,6 +67,8 @@ class PlatformContext:
             raise ValueError("miner_uid must be non-negative")
         if self.stats_window_s < 1:
             raise ValueError("stats_window_s must be positive")
+        if self.public_stats_ttl_s < 0:
+            raise ValueError("public_stats_ttl_s must not be negative")
 
 
 def create_app(ctx: PlatformContext) -> FastAPI:
@@ -364,6 +370,45 @@ def create_app(ctx: PlatformContext) -> FastAPI:
         )
         return Response(
             content=body, media_type="application/json", headers=response_headers
+        )
+
+    public_stats_cache = public.PublicStatsCache(ctx.public_stats_ttl_s)
+
+    # Loopback only. nginx never proxies this route: the control plane calls
+    # it and owns the browser-facing contract, so the inference data plane
+    # gains no public surface. See instant/platform/public.py.
+    #
+    # Deliberately `def`, not `async def`. ctx.state.stats() is a synchronous
+    # SQLite read that holds the state lock and parses every stored receipt in
+    # the window; awaiting it on the event loop would stall in-flight streaming
+    # completions for the duration. FastAPI runs a sync route in a threadpool,
+    # which keeps the inference data plane responsive while this one works.
+    @app.get("/public/v1/stats")
+    def public_stats() -> Response:
+        def compute() -> bytes:
+            generated_at_ms = _now_ms()
+            return public.encode(
+                public.project(
+                    ctx.state.stats(
+                        miner_hotkey=ctx.miner_ss58,
+                        miner_uid=ctx.miner_uid,
+                        window_start_ms=generated_at_ms - ctx.stats_window_s * 1000,
+                        window_end_ms=generated_at_ms,
+                        generated_at_ms=generated_at_ms,
+                    )
+                )
+            )
+
+        return Response(
+            content=public_stats_cache.get(compute),
+            media_type="application/json",
+            # The cache above already collapses concurrent readers, so a
+            # browser cache on top of it would add staleness without saving
+            # this process any work. The page measures age from its own fetch
+            # time (a client clock cannot be trusted), so a cached response is
+            # already up to one TTL older than the page will claim; layering a
+            # second cache would widen that gap further.
+            headers={"cache-control": "no-store"},
         )
 
     return app
