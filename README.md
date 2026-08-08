@@ -16,7 +16,7 @@ keys, quotas, billing, telemetry persistence, or dynamic miner routing. The vali
 does not yet probe miners, run scoring epochs, or submit weights. Those are the next
 build layer after the three processes are deployed and connected.
 
-The current test suite has **417 passing tests** and passes full-project Ruff lint.
+The current test suite has **418 passing tests** and passes full-project Ruff lint.
 
 ## Localnet state
 
@@ -174,7 +174,7 @@ set -a
 . ./.env.validator
 set +a
 mkdir -p logs
-pm2 start deploy/pm2/validator.ecosystem.cjs --update-env
+pm2 start deploy/pm2/validator.ecosystem.config.cjs --update-env
 pm2 status
 pm2 logs instant-validator --lines 100
 pm2 save
@@ -190,7 +190,8 @@ sudo install -d -o instant -g instant /var/lib/instant-subnet
 
 Replace `instant` if the service runs under a different Unix account.
 
-Use `miner.ecosystem.cjs` and `platform.ecosystem.cjs` on their respective hosts. The
+Use `miner.ecosystem.config.cjs` and `platform.ecosystem.config.cjs` on their respective
+hosts. The
 last command prints the privileged command needed to enable reboot startup; run that
 printed command once, then run `pm2 save` again.
 
