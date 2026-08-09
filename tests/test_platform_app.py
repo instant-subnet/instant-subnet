@@ -387,3 +387,65 @@ def _stats(client: TestClient, validator_key, platform_key) -> httpx.Response:
             validator_key, b"", signed_for=platform_key.ss58_address
         ),
     )
+
+
+def _thread_probe(monkeypatch, client: TestClient) -> tuple[set[int], set[int]]:
+    """Record which threads run loop code versus blocking state code."""
+    import threading
+
+    from instant.platform import app as app_module
+
+    loop_threads: set[int] = set()
+    state_threads: set[int] = set()
+
+    real_now = app_module._now_ms
+
+    def spy_now() -> int:
+        # Called inline from the async handlers, so it names the loop thread.
+        loop_threads.add(threading.get_ident())
+        return real_now()
+
+    monkeypatch.setattr(app_module, "_now_ms", spy_now)
+
+    state = client.app.state.ctx.state
+    for name in ("begin", "finish", "stats"):
+        real = getattr(state, name)
+
+        def spy(*args, _real=real, **kwargs):
+            state_threads.add(threading.get_ident())
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(state, name, spy)
+
+    return loop_threads, state_threads
+
+
+def test_state_writes_do_not_run_on_the_event_loop(client, monkeypatch):
+    """Every PlatformState call commits to SQLite while holding its lock.
+
+    On the deployed host one committed write costs ~2.5ms, so running these on
+    the event loop stalls the relay of every concurrent stream for that long.
+    They must be offloaded to a worker thread.
+    """
+    loop_threads, state_threads = _thread_probe(monkeypatch, client)
+
+    response = client.post("/v1/chat/completions", content=body_for())
+
+    assert response.status_code == 200
+    assert loop_threads, "probe never observed the event loop thread"
+    assert state_threads, "probe never observed a state call"
+    assert state_threads.isdisjoint(loop_threads)
+
+
+def test_stats_aggregation_does_not_run_on_the_event_loop(
+    client, validator_key, platform_key, monkeypatch
+):
+    """stats() is O(window) and verifies every stored receipt -- the costliest
+    of the three, and the one most likely to stall an in-flight stream."""
+    loop_threads, state_threads = _thread_probe(monkeypatch, client)
+
+    response = _stats(client, validator_key, platform_key)
+
+    assert response.status_code == 200
+    assert loop_threads and state_threads
+    assert state_threads.isdisjoint(loop_threads)
