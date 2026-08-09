@@ -11,7 +11,23 @@ from pathlib import Path
 from ..protocol import receipts
 from ..protocol.schemas import MinerStatsWindow, StatsResponse
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: Keys are 32 random bytes; the prefix is for display and lookup only, never
+#: for authentication. ``digest`` is an HMAC-SHA256 under a server-held pepper,
+#: so a stolen database alone does not yield usable credentials.
+_SCHEMA_KEYS = """
+CREATE TABLE api_keys (
+    key_id      TEXT PRIMARY KEY,
+    prefix      TEXT NOT NULL,
+    last4       TEXT NOT NULL,
+    digest      TEXT NOT NULL UNIQUE,
+    label       TEXT NOT NULL DEFAULT '',
+    created_ms  INTEGER NOT NULL,
+    revoked_ms  INTEGER
+);
+CREATE INDEX api_keys_by_digest ON api_keys (digest);
+"""
 
 _SCHEMA = """
 CREATE TABLE requests (
@@ -34,7 +50,14 @@ CREATE TABLE requests (
     error            TEXT
 );
 CREATE INDEX requests_by_window ON requests (miner_hotkey, started_ms);
-"""
+""" + _SCHEMA_KEYS
+
+#: Upgrades from an older on-disk schema, applied in order. Without this the
+#: gateway refuses to open a database written by a previous version, which
+#: would mean discarding the request and receipt history that validator scoring
+#: reads. Each step must be additive: a migration that rewrites rows can lose
+#: evidence a miner has already been paid for.
+_MIGRATIONS: dict[int, str] = {1: _SCHEMA_KEYS}
 
 
 class PlatformState:
@@ -48,6 +71,59 @@ class PlatformState:
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+    # --- API keys ---------------------------------------------------------
+    #
+    # The gateway stores only digests. A raw key exists in this process for the
+    # length of one registration call and is never written anywhere.
+
+    def register_key(
+        self,
+        *,
+        key_id: str,
+        prefix: str,
+        last4: str,
+        digest: str,
+        label: str,
+        created_ms: int,
+    ) -> None:
+        """Record a key the control plane has issued. Idempotent per digest."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO api_keys "
+                "(key_id, prefix, last4, digest, label, created_ms, revoked_ms) "
+                "VALUES (?,?,?,?,?,?,NULL) "
+                "ON CONFLICT(digest) DO UPDATE SET "
+                "label=excluded.label, revoked_ms=NULL",
+                (key_id, prefix, last4, digest, label, int(created_ms)),
+            )
+
+    def revoke_key(self, *, key_id: str, revoked_ms: int) -> bool:
+        """Revoke by id. Returns False if the key is unknown or already revoked."""
+        with self._lock, self._db:
+            cur = self._db.execute(
+                "UPDATE api_keys SET revoked_ms=? "
+                "WHERE key_id=? AND revoked_ms IS NULL",
+                (int(revoked_ms), key_id),
+            )
+            return cur.rowcount > 0
+
+    def key_is_active(self, digest: str) -> bool:
+        """True when this digest names a key that exists and is not revoked."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM api_keys WHERE digest=? AND revoked_ms IS NULL",
+                (digest,),
+            ).fetchone()
+        return row is not None
+
+    def list_keys(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT key_id, prefix, last4, label, created_ms, revoked_ms "
+                "FROM api_keys ORDER BY created_ms, key_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def begin(
         self,
@@ -221,10 +297,25 @@ def open_state(path: str | Path) -> PlatformState:
             with db:
                 db.executescript(_SCHEMA)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        elif version != SCHEMA_VERSION:
+        elif version > SCHEMA_VERSION:
+            # Forward-dated database: this binary is older than the one that
+            # wrote it. Refuse rather than guess at a schema we do not know.
             raise RuntimeError(
-                f"unsupported platform database schema {version}; expected {SCHEMA_VERSION}"
+                f"platform database schema {version} is newer than this build "
+                f"supports ({SCHEMA_VERSION}); deploy the newer release or "
+                f"restore a matching backup"
             )
+        elif version < SCHEMA_VERSION:
+            for step in range(version, SCHEMA_VERSION):
+                script = _MIGRATIONS.get(step)
+                if script is None:
+                    raise RuntimeError(
+                        f"no migration from platform database schema {step}; "
+                        f"cannot reach {SCHEMA_VERSION}"
+                    )
+                with db:
+                    db.executescript(script)
+                    db.execute(f"PRAGMA user_version={step + 1}")
     except Exception:
         db.close()
         raise

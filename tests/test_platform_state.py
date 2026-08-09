@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from instant.platform.state import open_state
 from instant.protocol import receipts
 
@@ -144,3 +146,50 @@ def test_an_unfinished_attempt_is_a_failure_not_forgotten(tmp_path, miner_key):
     ).miners[0]
     state.close()
     assert (stats.requests, stats.successes, stats.failures) == (1, 0, 1)
+
+
+def test_a_v1_database_migrates_without_losing_telemetry(tmp_path):
+    """The deployed database holds request and receipt history that scoring
+    reads. A migration that drops it would silently erase evidence a miner has
+    already been paid for, so prove the rows survive."""
+    import sqlite3
+
+    from instant.platform import state as state_mod
+
+    path = tmp_path / "v1.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript(state_mod._SCHEMA.replace(state_mod._SCHEMA_KEYS, ""))
+    db.execute("PRAGMA user_version=1")
+    db.execute(
+        "INSERT INTO requests (request_id, miner_hotkey, started_ms, stream, success) "
+        "VALUES ('req-1','5Miner',1000,0,1)"
+    )
+    db.commit()
+    db.close()
+
+    migrated = open_state(path)
+    try:
+        rows = migrated._db.execute("SELECT request_id FROM requests").fetchall()
+        assert [r[0] for r in rows] == ["req-1"], "telemetry lost during migration"
+        version = migrated._db.execute("PRAGMA user_version").fetchone()[0]
+        assert version == state_mod.SCHEMA_VERSION
+        # And the new table is usable.
+        migrated.register_key(
+            key_id="k", prefix="isk_abcd", last4="wxyz",
+            digest="d" * 64, label="", created_ms=1,
+        )
+        assert migrated.key_is_active("d" * 64)
+    finally:
+        migrated.close()
+
+
+def test_a_future_schema_is_refused_rather_than_guessed(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "future.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA user_version=99")
+    db.commit()
+    db.close()
+    with pytest.raises(RuntimeError, match="newer than this build"):
+        open_state(path)

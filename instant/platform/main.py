@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 
@@ -102,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
             http=httpx.AsyncClient(timeout=settings.request_timeout_s),
             state=open_state(settings.platform_state_db),
             api_key_sha256=settings.platform_api_key_sha256,
+            # Read straight from the environment, never through Settings:
+            # Settings is logged by describe(), and these are credentials.
+            api_key_pepper=os.environ.get("INSTANT_PLATFORM_API_KEY_PEPPER", ""),
+            admin_token=os.environ.get("INSTANT_PLATFORM_ADMIN_TOKEN", ""),
             validator_hotkeys=frozenset({settings.platform_validator_ss58}),
             miner_uid=settings.platform_miner_uid,
             stats_window_s=settings.platform_stats_window_s,

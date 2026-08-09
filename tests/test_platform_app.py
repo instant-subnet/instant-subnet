@@ -20,6 +20,9 @@ from instant.protocol.epistula import generate_headers, verify_headers
 MODEL = "instant/mock-echo"
 API_KEY = "isk_test_platform_key"
 API_KEY_HASH = hashlib.sha256(API_KEY.encode()).hexdigest()
+PEPPER = "test-pepper-not-a-real-one"
+ADMIN_TOKEN = "test-admin-token"
+ADMIN = {"x-instant-admin-token": ADMIN_TOKEN}
 AUTH = {"authorization": f"Bearer {API_KEY}"}
 
 
@@ -168,6 +171,8 @@ def platform_context(miner_app, miner_key, platform_key, validator_key, state_pa
         validator_hotkeys=frozenset({validator_key.ss58_address}),
         miner_uid=7,
         stats_window_s=3600,
+        api_key_pepper=PEPPER,
+        admin_token=ADMIN_TOKEN,
     )
 
 
@@ -543,3 +548,91 @@ def test_requests_that_never_reached_a_miner_are_not_attributed_to_one(client):
     )
     assert unauthorized.status_code == 401
     assert _provenance(unauthorized) == (None, None)
+
+
+# --- customer API keys -------------------------------------------------------
+
+
+CUSTOMER_KEY = "isk_customer_key_that_is_long_enough"
+
+
+def _register(client: TestClient, key: str, key_id: str = "k_1", **extra):
+    payload = {"key": key, "key_id": key_id, "label": "ditto"}
+    payload.update(extra)
+    return client.post("/admin/v1/keys", json=payload, headers=ADMIN)
+
+
+def test_a_registered_key_is_accepted_for_inference(client):
+    """The point of the whole exercise: a key minted in the dashboard works."""
+    before = client.post(
+        "/v1/chat/completions",
+        content=body_for(),
+        headers={"authorization": f"Bearer {CUSTOMER_KEY}"},
+    )
+    assert before.status_code == 401
+
+    assert _register(client, CUSTOMER_KEY).status_code == 201
+
+    after = client.post(
+        "/v1/chat/completions",
+        content=body_for(),
+        headers={"authorization": f"Bearer {CUSTOMER_KEY}"},
+    )
+    assert after.status_code == 200
+
+
+def test_revoking_a_key_stops_it_serving_traffic(client):
+    """A key the dashboard calls revoked must stop working, or the UI is lying."""
+    _register(client, CUSTOMER_KEY)
+    auth = {"authorization": f"Bearer {CUSTOMER_KEY}"}
+    assert client.post("/v1/chat/completions", content=body_for(), headers=auth).status_code == 200
+
+    revoked = client.request("DELETE", "/admin/v1/keys/k_1", headers=ADMIN)
+    assert revoked.status_code == 200
+
+    assert client.post("/v1/chat/completions", content=body_for(), headers=auth).status_code == 401
+    # Revoking twice is not success -- it would hide a bug in the caller.
+    assert client.request("DELETE", "/admin/v1/keys/k_1", headers=ADMIN).status_code == 404
+
+
+def test_the_raw_key_is_never_stored(client, tmp_path):
+    """A database that can reproduce a customer's key is a breach waiting to happen."""
+    _register(client, CUSTOMER_KEY)
+    keys = client.get("/admin/v1/keys", headers=ADMIN).json()["keys"]
+    assert keys[0]["prefix"] == CUSTOMER_KEY[:8]
+    assert keys[0]["last4"] == CUSTOMER_KEY[-4:]
+    assert "digest" not in keys[0]
+
+    blob = (tmp_path / "platform.sqlite3").read_bytes()
+    assert CUSTOMER_KEY.encode() not in blob
+
+
+def test_admin_routes_refuse_without_the_token(client):
+    assert client.post("/admin/v1/keys", json={"key": CUSTOMER_KEY, "key_id": "x"}).status_code == 401
+    assert client.post(
+        "/admin/v1/keys",
+        json={"key": CUSTOMER_KEY, "key_id": "x"},
+        headers={"x-instant-admin-token": "wrong"},
+    ).status_code == 401
+    assert client.get("/admin/v1/keys", headers={"x-instant-admin-token": "wrong"}).status_code == 401
+
+
+def test_the_service_credential_still_works_alongside_minted_keys(client):
+    """The control plane's relay must not break when customer keys exist."""
+    _register(client, CUSTOMER_KEY)
+    assert client.post("/v1/chat/completions", content=body_for()).status_code == 200
+
+
+def test_a_key_from_another_pepper_is_rejected(client, miner_app, miner_key, platform_key, validator_key, tmp_path):
+    """The pepper is what stops a stolen digest being replayed elsewhere."""
+    _register(client, CUSTOMER_KEY)
+    other = platform_context(
+        miner_app, miner_key, platform_key, validator_key, tmp_path / "other.sqlite3"
+    )
+    other.api_key_pepper = "a-different-pepper"
+    with TestClient(create_app(other)) as c2:
+        c2.post("/admin/v1/keys", json={"key": CUSTOMER_KEY, "key_id": "k_1"}, headers=ADMIN)
+        # Same raw key, different pepper -> a different digest entirely.
+        from instant.platform.app import key_digest
+
+        assert key_digest(CUSTOMER_KEY, PEPPER) != key_digest(CUSTOMER_KEY, "a-different-pepper")

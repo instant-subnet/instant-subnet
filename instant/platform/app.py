@@ -53,6 +53,12 @@ class PlatformContext:
     # How long one computed public stats body is reused. Injectable so tests
     # can pin it rather than racing a ten-second wall clock.
     public_stats_ttl_s: float = public.DEFAULT_TTL_S
+    #: Pepper for customer key digests. Empty disables DB-backed keys entirely,
+    #: leaving only the env service credential.
+    api_key_pepper: str = ""
+    #: Shared secret the control plane presents to the key-management routes.
+    #: Empty refuses every admin call, so a blank env var cannot open issuance.
+    admin_token: str = ""
     validator_replay: ReplayGuard = field(default_factory=ReplayGuard)
 
     def __post_init__(self) -> None:
@@ -351,6 +357,74 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             media_type=_media_type(upstream, "text/event-stream"),
         )
 
+    @app.post("/admin/v1/keys")
+    async def admin_register_key(request: Request) -> Response:
+        """Register a key the control plane has just issued.
+
+        The raw key arrives once, is digested here, and is never stored or
+        logged. The gateway keeps its own digest so the two services share no
+        secret: the control plane cannot compute what we hold, and we cannot
+        reproduce what it shows the operator.
+
+        nginx has no location for this path and ends in ``return 404``, so it is
+        unreachable from the internet; the admin token guards it against other
+        processes on this host.
+        """
+        if not _admin_ok(ctx, request):
+            return _error(401, "unauthorized", "admin token required")
+        if not ctx.api_key_pepper:
+            return _error(
+                503,
+                "keys_unavailable",
+                "INSTANT_PLATFORM_API_KEY_PEPPER is not configured",
+            )
+        try:
+            body = json.loads(await request.body())
+        except ValueError as exc:
+            return _error(400, "bad_request", str(exc))
+        if not isinstance(body, dict):
+            return _error(400, "bad_request", "expected a JSON object")
+        token = body.get("key")
+        key_id = body.get("key_id")
+        if not isinstance(token, str) or len(token) < 16:
+            return _error(400, "bad_request", "key must be at least 16 characters")
+        if not isinstance(key_id, str) or not key_id:
+            return _error(400, "bad_request", "key_id is required")
+        label = body.get("label") or ""
+        if not isinstance(label, str) or len(label) > 200:
+            return _error(400, "bad_request", "label must be a string under 200 chars")
+        await run_in_threadpool(
+            ctx.state.register_key,
+            key_id=key_id,
+            prefix=token[:8],
+            last4=token[-4:],
+            digest=key_digest(token, ctx.api_key_pepper),
+            label=label,
+            created_ms=_now_ms(),
+        )
+        return JSONResponse({"key_id": key_id, "status": "registered"}, status_code=201)
+
+    @app.delete("/admin/v1/keys/{key_id}")
+    async def admin_revoke_key(key_id: str, request: Request) -> Response:
+        """Revoke a key. Must be called whenever the UI revokes one, or the
+        dashboard would report a key as dead while the API still serves it."""
+        if not _admin_ok(ctx, request):
+            return _error(401, "unauthorized", "admin token required")
+        revoked = await run_in_threadpool(
+            ctx.state.revoke_key, key_id=key_id, revoked_ms=_now_ms()
+        )
+        if not revoked:
+            return _error(404, "not_found", "no active key with that id")
+        return JSONResponse({"key_id": key_id, "status": "revoked"})
+
+    @app.get("/admin/v1/keys")
+    async def admin_list_keys(request: Request) -> Response:
+        """Digests are never returned -- only what is safe to display."""
+        if not _admin_ok(ctx, request):
+            return _error(401, "unauthorized", "admin token required")
+        keys = await run_in_threadpool(ctx.state.list_keys)
+        return JSONResponse({"keys": keys})
+
     @app.get("/validator/v1/stats")
     async def validator_stats(request: Request) -> Response:
         raw = await request.body()
@@ -570,13 +644,51 @@ def _verify_receipt(
         raise receipts.ReceiptError("receipt names a different request signer")
 
 
-def _bearer_ok(ctx: PlatformContext, request: Request) -> bool:
+def key_digest(token: str, pepper: str) -> str:
+    """Digest a customer key for storage and lookup.
+
+    HMAC under a server-held pepper rather than a bare hash: the key is 32
+    random bytes, so brute force is not the threat -- the pepper is what stops
+    a stolen database from being replayed against the running gateway.
+    """
+    return hmac.new(pepper.encode(), token.encode(), hashlib.sha256).hexdigest()
+
+
+def _bearer_token(request: Request) -> str | None:
     header = request.headers.get("authorization", "")
     scheme, separator, token = header.partition(" ")
     if not separator or scheme.lower() != "bearer" or not token:
+        return None
+    return token
+
+
+def _bearer_ok(ctx: PlatformContext, request: Request) -> bool:
+    token = _bearer_token(request)
+    if token is None:
         return False
-    digest = hashlib.sha256(token.encode()).hexdigest()
-    return hmac.compare_digest(digest, ctx.api_key_sha256)
+    # The env key is the control plane's service credential, checked first and
+    # in constant time so an empty key table never locks the gateway out.
+    if hmac.compare_digest(
+        hashlib.sha256(token.encode()).hexdigest(), ctx.api_key_sha256
+    ):
+        return True
+    if not ctx.api_key_pepper:
+        return False
+    return ctx.state.key_is_active(key_digest(token, ctx.api_key_pepper))
+
+
+def _admin_ok(ctx: PlatformContext, request: Request) -> bool:
+    """Authorise a control-plane call to the key-management routes.
+
+    Constant-time, and refuses outright when no token is configured so a blank
+    environment variable cannot silently open key issuance to any local caller.
+    """
+    if not ctx.admin_token:
+        return False
+    presented = request.headers.get("x-instant-admin-token", "")
+    if not presented:
+        return False
+    return hmac.compare_digest(presented, ctx.admin_token)
 
 
 def _bearer_error() -> JSONResponse:
