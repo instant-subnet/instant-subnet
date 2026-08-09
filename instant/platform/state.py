@@ -93,8 +93,10 @@ class PlatformState:
                 "INSERT INTO api_keys "
                 "(key_id, prefix, last4, digest, label, created_ms, revoked_ms) "
                 "VALUES (?,?,?,?,?,?,NULL) "
-                "ON CONFLICT(digest) DO UPDATE SET "
-                "label=excluded.label, revoked_ms=NULL",
+                # Idempotent for retries, but deliberately does NOT clear
+                # revoked_ms: registering a key must never be able to undo a
+                # revocation. A revoked secret stays dead; mint a new one.
+                "ON CONFLICT(digest) DO UPDATE SET label=excluded.label",
                 (key_id, prefix, last4, digest, label, int(created_ms)),
             )
 

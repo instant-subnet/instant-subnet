@@ -193,3 +193,21 @@ def test_a_future_schema_is_refused_rather_than_guessed(tmp_path):
     db.close()
     with pytest.raises(RuntimeError, match="newer than this build"):
         open_state(path)
+
+
+def test_registering_a_revoked_digest_does_not_resurrect_it(tmp_path):
+    """Registration must never undo a revocation, or revoke is bypassable."""
+    state = open_state(tmp_path / "keys.sqlite3")
+    try:
+        digest = "a" * 64
+        state.register_key(key_id="k1", prefix="isk_aaaa", last4="zzzz",
+                           digest=digest, label="first", created_ms=1)
+        assert state.key_is_active(digest)
+        assert state.revoke_key(key_id="k1", revoked_ms=2)
+        assert not state.key_is_active(digest)
+
+        state.register_key(key_id="k1", prefix="isk_aaaa", last4="zzzz",
+                           digest=digest, label="second", created_ms=3)
+        assert not state.key_is_active(digest), "a revoked key came back to life"
+    finally:
+        state.close()

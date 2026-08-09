@@ -55,6 +55,9 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
   "ruff>=0.6",
+  # scripts/e2e_sdk.py drives the customer path with the real client, because
+  # the product claim is "your OpenAI code works" and only the SDK tests that.
+  "openai>=1.40",
 ]
 
 [project.scripts]
