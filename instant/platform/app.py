@@ -208,7 +208,9 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                     total_ms=elapsed_ms,
                     error=f"miner unavailable: {exc}",
                 )
-                return _error(502, "miner_unavailable", str(exc))
+                return _error(
+                    502, "miner_unavailable", str(exc), _provenance_headers(ctx)
+                )
 
             elapsed_ms = _elapsed_ms(started_perf)
             evidence = _verify_header_receipt(
@@ -235,7 +237,7 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             return Response(
                 content=upstream.content,
                 status_code=upstream.status_code,
-                headers=_response_headers(upstream),
+                headers=_response_headers(upstream, ctx),
                 media_type=_media_type(upstream, "application/json"),
             )
 
@@ -253,10 +255,12 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                 total_ms=elapsed_ms,
                 error=f"miner unavailable: {exc}",
             )
-            return _error(502, "miner_unavailable", str(exc))
+            return _error(
+                502, "miner_unavailable", str(exc), _provenance_headers(ctx)
+            )
         if upstream.status_code >= 400:
             body = await upstream.aread()
-            response_headers = _response_headers(upstream)
+            response_headers = _response_headers(upstream, ctx)
             media_type = _media_type(upstream, "application/json")
             await upstream.aclose()
             elapsed_ms = _elapsed_ms(started_perf)
@@ -343,7 +347,7 @@ def create_app(ctx: PlatformContext) -> FastAPI:
         return StreamingResponse(
             relay(),
             status_code=upstream.status_code,
-            headers=_response_headers(upstream),
+            headers=_response_headers(upstream, ctx),
             media_type=_media_type(upstream, "text/event-stream"),
         )
 
@@ -616,17 +620,51 @@ def _elapsed_ms(started_perf: float) -> int:
     return max(0, int((time.perf_counter() - started_perf) * 1000))
 
 
-def _response_headers(response: httpx.Response) -> dict[str, str]:
+def _provenance_headers(ctx: PlatformContext) -> dict[str, str]:
+    """Name the miner that handled a request.
+
+    Written from ``ctx`` and never forwarded from upstream. A miner is an
+    economically motivated adversary; letting it name the hotkey that served a
+    request would let it credit another operator, or discredit one. Neither
+    header is in ``_FORWARDED_RESPONSE_HEADERS``, so an upstream copy is dropped
+    before this is applied.
+
+    Deliberately absent: ``X-Instant-Ttft-Ms``. On the streaming path headers
+    flush before the first token, so the value does not exist yet; on the
+    non-streaming path there is no observable first-token event and the recorded
+    figure is total latency under another name. Measured TTFT reaches consumers
+    through the receipt and the validator stats window instead.
+    """
     return {
+        "X-Instant-Miner-Uid": str(ctx.miner_uid),
+        "X-Instant-Miner-Hotkey": ctx.miner_ss58,
+    }
+
+
+def _response_headers(
+    response: httpx.Response, ctx: PlatformContext | None = None
+) -> dict[str, str]:
+    """Forward the miner's allow-listed headers, then stamp our own provenance."""
+    headers = {
         name: value
         for name, value in response.headers.items()
         if name.lower() in _FORWARDED_RESPONSE_HEADERS
     }
+    if ctx is not None:
+        headers.update(_provenance_headers(ctx))
+    return headers
 
 
 def _media_type(response: httpx.Response, default: str) -> str:
     return response.headers.get("content-type", default).split(";", 1)[0]
 
 
-def _error(status: int, error: str, detail: str | None = None) -> JSONResponse:
-    return JSONResponse({"error": error, "detail": detail}, status_code=status)
+def _error(
+    status: int,
+    error: str,
+    detail: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        {"error": error, "detail": detail}, status_code=status, headers=headers
+    )

@@ -34,11 +34,26 @@ def body_for(*, stream: bool = False) -> bytes:
     ).encode()
 
 
+SPOOFED_UID = "999"
+SPOOFED_HOTKEY = "5SpoofedHotkeyThatMustNeverReachAClient"
+
+
+def _spoofed(app: FastAPI) -> dict[str, str]:
+    """A hostile miner claiming to be someone else."""
+    if not app.state.spoof_provenance:
+        return {}
+    return {
+        "X-Instant-Miner-Uid": SPOOFED_UID,
+        "X-Instant-Miner-Hotkey": SPOOFED_HOTKEY,
+    }
+
+
 @pytest.fixture
 def miner_app(miner_key, platform_key):
     app = FastAPI()
     app.state.requests = []
     app.state.corrupt_receipt = False
+    app.state.spoof_provenance = False
 
     @app.get("/health")
     async def health():
@@ -96,13 +111,15 @@ def miner_app(miner_key, platform_key):
                     + b"\n\n"
                 )
 
+            stream_headers = {
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            }
+            stream_headers.update(_spoofed(app))
             return StreamingResponse(
                 chunks(),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
-                },
+                headers=stream_headers,
             )
 
         response_body = b'{"id":"answer"}'
@@ -121,16 +138,18 @@ def miner_app(miner_key, platform_key):
             attestation_id="attest-1",
         )
         signature = "00" * 64 if app.state.corrupt_receipt else signed.signature
+        plain_headers = {
+            receipts.H_RECEIPT: json.dumps(
+                signed.receipt.to_payload(), separators=(",", ":")
+            ),
+            receipts.H_RECEIPT_SIG: signature,
+            "X-Instant-Request-Id": verified.uuid,
+        }
+        plain_headers.update(_spoofed(app))
         return Response(
             content=response_body,
             media_type="application/json",
-            headers={
-                receipts.H_RECEIPT: json.dumps(
-                    signed.receipt.to_payload(), separators=(",", ":")
-                ),
-                receipts.H_RECEIPT_SIG: signature,
-                "X-Instant-Request-Id": verified.uuid,
-            },
+            headers=plain_headers,
         )
 
     return app
@@ -449,3 +468,78 @@ def test_stats_aggregation_does_not_run_on_the_event_loop(
     assert response.status_code == 200
     assert loop_threads and state_threads
     assert state_threads.isdisjoint(loop_threads)
+def _provenance(response: httpx.Response) -> tuple[str | None, str | None]:
+    return (
+        response.headers.get("x-instant-miner-uid"),
+        response.headers.get("x-instant-miner-hotkey"),
+    )
+
+
+def test_successful_responses_name_the_miner_that_served_them(client, miner_key):
+    uid = str(client.app.state.ctx.miner_uid)
+    plain = client.post("/v1/chat/completions", content=body_for())
+    assert plain.status_code == 200
+    assert _provenance(plain) == (uid, miner_key.ss58_address)
+
+    with client.stream(
+        "POST", "/v1/chat/completions", content=body_for(stream=True)
+    ) as streamed:
+        assert streamed.status_code == 200
+        assert _provenance(streamed) == (uid, miner_key.ss58_address)
+
+
+def test_a_miner_cannot_claim_another_operators_identity(client, miner_app, miner_key):
+    uid = str(client.app.state.ctx.miner_uid)
+    """The header is written from our config, never forwarded from upstream."""
+    miner_app.state.spoof_provenance = True
+
+    plain = client.post("/v1/chat/completions", content=body_for())
+    assert _provenance(plain) == (uid, miner_key.ss58_address)
+    assert SPOOFED_HOTKEY not in plain.headers.values()
+
+    with client.stream(
+        "POST", "/v1/chat/completions", content=body_for(stream=True)
+    ) as streamed:
+        assert _provenance(streamed) == (uid, miner_key.ss58_address)
+        assert SPOOFED_HOTKEY not in streamed.headers.values()
+
+
+def test_an_unreachable_miner_is_still_named(client, miner_key, monkeypatch):
+    """502s are exactly when a caller needs to know which miner failed them."""
+    ctx = client.app.state.ctx
+    uid = str(ctx.miner_uid)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(
+        ctx,
+        "http",
+        httpx.AsyncClient(transport=httpx.MockTransport(refuse), base_url="http://miner"),
+    )
+
+    plain = client.post("/v1/chat/completions", content=body_for())
+    assert plain.status_code == 502
+    assert _provenance(plain) == (uid, miner_key.ss58_address)
+
+    streamed = client.post("/v1/chat/completions", content=body_for(stream=True))
+    assert streamed.status_code == 502
+    assert _provenance(streamed) == (uid, miner_key.ss58_address)
+
+
+def test_requests_that_never_reached_a_miner_are_not_attributed_to_one(client):
+    """A rejected request was served by nobody; saying otherwise would be false,
+    and on 401 it would hand miner identity to an unauthenticated caller."""
+    malformed = client.post(
+        "/v1/chat/completions",
+        content=b'{"model":"missing-messages"}',
+        headers={"content-type": "application/json"},
+    )
+    assert malformed.status_code == 400
+    assert _provenance(malformed) == (None, None)
+
+    unauthorized = client.post(
+        "/v1/chat/completions", content=body_for(), headers={"authorization": "Bearer x"}
+    )
+    assert unauthorized.status_code == 401
+    assert _provenance(unauthorized) == (None, None)
