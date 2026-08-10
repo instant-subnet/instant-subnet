@@ -456,6 +456,7 @@ def test_stream_ends_with_a_verifiable_receipt(client, platform_key, miner_key, 
         text = "".join(r.iter_text())
 
     assert "data: [DONE]" in text
+    assert text.index("event: receipt") < text.index("data: [DONE]")
     events = sse_events(text)
     assert [name for name, _ in events] == [receipts.SSE_RECEIPT_EVENT]
 

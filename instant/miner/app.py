@@ -286,13 +286,14 @@ def _stream_response(
     signed_by: str,
     started_ms: int,
 ) -> StreamingResponse:
-    """Stream tokens, then the receipt as the final SSE event.
+    """Stream tokens, then a receipt before the terminal SSE marker.
 
-    The receipt goes last because it commits to the response hash, which is
-    not known until the last token is out. A client that only wants tokens
-    ignores the ``receipt`` event; a validator reads it. Trailers would be
-    the tidier mechanism and are not reliably delivered through the
-    intermediaries that sit between us and a browser, so: an SSE event.
+    The receipt follows the final token because it commits to the response
+    hash, which is not known before then. It must precede ``[DONE]`` because
+    OpenAI clients are allowed to stop reading at that marker. The platform
+    consumes this internal event; customers receive only standard token frames
+    and one terminal marker. Trailers would be tidier and are not reliably
+    delivered through the intermediaries between a miner and browser.
 
     If the upstream fails mid-stream there is no receipt — the miner did not
     complete the work and must not sign as though it had. The client gets an
@@ -312,13 +313,16 @@ def _stream_response(
         finally:
             ctx.in_flight -= 1
 
-        yield b"data: [DONE]\n\n"
-
         signed = _sign_receipt(
             ctx, request_id, signed_by, raw_request, bytes(outcome.assembled),
             outcome, started_ms,
         )
         yield _sse(receipts.SSE_RECEIPT_EVENT, signed.to_payload())
+        # The platform consumes the private receipt event, verifies and records
+        # it, then emits the one customer-facing terminal marker. OpenAI SDKs
+        # stop reading at [DONE], so placing the receipt after it makes verified
+        # telemetry depend on bytes a compliant client is allowed to ignore.
+        yield b"data: [DONE]\n\n"
 
     return StreamingResponse(
         body_iter(),

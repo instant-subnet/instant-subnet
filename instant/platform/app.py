@@ -28,7 +28,7 @@ from ..protocol.keys import Signer
 from ..protocol.schemas import ChatCompletionRequest
 from ..protocol.ss58 import is_valid
 from . import public
-from .state import PlatformState
+from .state import KeyConflictError, KeyRevokedError, PlatformState
 
 _FORWARDED_RESPONSE_HEADERS = {
     "x-instant-receipt",
@@ -131,7 +131,7 @@ def create_app(ctx: PlatformContext) -> FastAPI:
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
-        if not _bearer_ok(ctx, request):
+        if not await _bearer_ok(ctx, request):
             return _bearer_error()
         try:
             response = await ctx.http.get(f"{ctx.miner_url}/manifest")
@@ -166,7 +166,7 @@ def create_app(ctx: PlatformContext) -> FastAPI:
     async def chat_completions(request: Request) -> Response:
         # Authenticate before reading, validating, signing, or forwarding a
         # potentially large request body.
-        if not _bearer_ok(ctx, request):
+        if not await _bearer_ok(ctx, request):
             return _bearer_error()
 
         raw = await request.body()
@@ -240,10 +240,21 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                 receipt_verified=evidence.verified,
                 error=None if success else evidence.error or f"miner HTTP {upstream.status_code}",
             )
+            if 200 <= upstream.status_code < 300 and not evidence.verified:
+                return _error(
+                    502,
+                    "invalid_miner_receipt",
+                    evidence.error or "miner response could not be verified",
+                    _provenance_headers(ctx),
+                )
             return Response(
                 content=upstream.content,
                 status_code=upstream.status_code,
-                headers=_response_headers(upstream, ctx),
+                headers=(
+                    _response_headers(upstream, ctx, request_id=request_id)
+                    if evidence.verified
+                    else _unverified_response_headers(ctx, request_id=request_id)
+                ),
                 media_type=_media_type(upstream, "application/json"),
             )
 
@@ -266,7 +277,9 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             )
         if upstream.status_code >= 400:
             body = await upstream.aread()
-            response_headers = _response_headers(upstream, ctx)
+            response_headers = _stream_response_headers(
+                upstream, ctx, request_id=request_id
+            )
             media_type = _media_type(upstream, "application/json")
             await upstream.aclose()
             elapsed_ms = _elapsed_ms(started_perf)
@@ -291,10 +304,12 @@ def create_app(ctx: PlatformContext) -> FastAPI:
 
         async def relay() -> AsyncIterator[bytes]:
             relay_error: str | None = None
+            completed = False
             try:
                 async for chunk in upstream.aiter_raw():
-                    observer.feed(chunk)
-                    yield chunk
+                    for customer_frame in observer.feed(chunk):
+                        yield customer_frame
+                completed = True
             except httpx.HTTPError as exc:
                 relay_error = f"miner stream failed: {exc}"
                 raise
@@ -311,7 +326,9 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                     )
                     success = (
                         relay_error is None
+                        and 200 <= upstream.status_code < 300
                         and not observer.error_event
+                        and observer.protocol_error is None
                         and evidence.verified
                     )
                     receipt = evidence.signed_receipt if evidence.verified else None
@@ -346,14 +363,33 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                             if success
                             else relay_error
                             or ("miner emitted an error event" if observer.error_event else None)
+                            or observer.protocol_error
                             or evidence.error
                         ),
                     )
 
+            # Commit the verified result before publishing the terminal marker.
+            # Standard OpenAI clients stop reading as soon as they see [DONE],
+            # so work placed after this yield is not guaranteed to run.
+            if completed and success:
+                yield b"data: [DONE]\n\n"
+            elif completed:
+                detail = evidence.error or "miner stream could not be verified"
+                payload = json.dumps(
+                    {
+                        "error": {
+                            "type": "invalid_miner_receipt",
+                            "message": detail,
+                        }
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                yield b"data: " + payload + b"\n\n"
+
         return StreamingResponse(
             relay(),
             status_code=upstream.status_code,
-            headers=_response_headers(upstream, ctx),
+            headers=_stream_response_headers(upstream, ctx, request_id=request_id),
             media_type=_media_type(upstream, "text/event-stream"),
         )
 
@@ -393,16 +429,24 @@ def create_app(ctx: PlatformContext) -> FastAPI:
         label = body.get("label") or ""
         if not isinstance(label, str) or len(label) > 200:
             return _error(400, "bad_request", "label must be a string under 200 chars")
-        await run_in_threadpool(
-            ctx.state.register_key,
-            key_id=key_id,
-            prefix=token[:8],
-            last4=token[-4:],
-            digest=key_digest(token, ctx.api_key_pepper),
-            label=label,
-            created_ms=_now_ms(),
+        try:
+            status = await run_in_threadpool(
+                ctx.state.register_key,
+                key_id=key_id,
+                prefix=token[:8],
+                last4=token[-4:],
+                digest=key_digest(token, ctx.api_key_pepper),
+                label=label,
+                created_ms=_now_ms(),
+            )
+        except KeyRevokedError as exc:
+            return _error(409, "key_revoked", str(exc))
+        except KeyConflictError as exc:
+            return _error(409, "key_conflict", str(exc))
+        return JSONResponse(
+            {"key_id": key_id, "status": status},
+            status_code=201 if status == "registered" else 200,
         )
-        return JSONResponse({"key_id": key_id, "status": "registered"}, status_code=201)
 
     @app.delete("/admin/v1/keys/{key_id}")
     async def admin_revoke_key(key_id: str, request: Request) -> Response:
@@ -555,44 +599,76 @@ class _StreamObserver:
         self.receipt_payload: dict[str, Any] | None = None
         self.receipt_seen = False
         self.error_event = False
+        self.protocol_error: str | None = None
 
-    def feed(self, chunk: bytes) -> None:
+    def feed(self, chunk: bytes) -> list[bytes]:
+        forwarded: list[bytes] = []
         self.buffer.extend(chunk)
         while True:
             boundary = _frame_boundary(self.buffer)
             if boundary is None:
-                return
+                return forwarded
             index, width = boundary
             frame = bytes(self.buffer[:index])
             del self.buffer[: index + width]
-            self._frame(frame)
+            if self._frame(frame):
+                # Normalise the separator only; the frame bytes are otherwise
+                # relayed exactly. The receipt and upstream [DONE] stay inside
+                # the trusted platform/miner hop.
+                forwarded.append(frame + b"\n\n")
 
-    def _frame(self, raw: bytes) -> None:
+    def _frame(self, raw: bytes) -> bool:
         lines = raw.replace(b"\r\n", b"\n").split(b"\n")
         event = next(
             (line[6:].strip().decode() for line in lines if line.startswith(b"event:")),
             None,
         )
         data_lines = [line[5:].strip() for line in lines if line.startswith(b"data:")]
-        if not data_lines:
-            return
-        data = b"\n".join(data_lines)
+        if event == receipts.SSE_RECEIPT_EVENT:
+            self.receipt_seen = True
+            if not data_lines:
+                self.protocol_error = "miner emitted a receipt event without data"
+                return False
+            try:
+                payload = json.loads(b"\n".join(data_lines))
+                self.receipt_payload = payload if isinstance(payload, dict) else None
+            except ValueError:
+                self.receipt_payload = None
+            return False
+        if event == "error":
+            self.error_event = True
+            return False
         if event is not None:
-            if event == receipts.SSE_RECEIPT_EVENT:
-                self.receipt_seen = True
-                try:
-                    payload = json.loads(data)
-                    self.receipt_payload = payload if isinstance(payload, dict) else None
-                except ValueError:
-                    self.receipt_payload = None
-            elif event == "error":
-                self.error_event = True
-            return
+            # Only ordinary OpenAI data frames are part of the receipt's
+            # response commitment. Forwarding an arbitrary named event would
+            # let a miner show bytes to the customer that it never signed.
+            self.protocol_error = f"miner emitted unsupported SSE event {event!r}"
+            return False
+        if self.protocol_error is not None or self.error_event:
+            return False
+        if not data_lines:
+            # SSE comment heartbeats are transport metadata, not model output,
+            # and keep long reasoning requests alive through intermediaries.
+            nonblank = [line.strip() for line in lines if line.strip()]
+            return bool(nonblank) and all(line.startswith(b":") for line in nonblank)
+        data = b"\n".join(data_lines)
         if data == b"[DONE]":
-            return
+            return False
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            self.protocol_error = "miner emitted a non-JSON SSE data frame"
+            return False
+        if not isinstance(payload, dict):
+            self.protocol_error = "miner emitted a non-object SSE data frame"
+            return False
+        if payload.get("error") is not None:
+            self.error_event = True
+            return False
         self.assembled.extend(data)
         if self.first_content_perf is None and _has_content(data):
             self.first_content_perf = time.perf_counter()
+        return True
 
     def ttft_ms(self, total_ms: int) -> int:
         if self.first_content_perf is None:
@@ -606,6 +682,8 @@ class _StreamObserver:
         request_id: str,
         request_body: bytes,
     ) -> _ReceiptEvidence:
+        if self.protocol_error is not None:
+            return _ReceiptEvidence(seen=self.receipt_seen, error=self.protocol_error)
         if not self.receipt_seen or self.receipt_payload is None:
             detail = "miner emitted an error event" if self.error_event else "receipt missing"
             return _ReceiptEvidence(seen=self.receipt_seen, error=detail)
@@ -662,7 +740,7 @@ def _bearer_token(request: Request) -> str | None:
     return token
 
 
-def _bearer_ok(ctx: PlatformContext, request: Request) -> bool:
+async def _bearer_ok(ctx: PlatformContext, request: Request) -> bool:
     token = _bearer_token(request)
     if token is None:
         return False
@@ -674,7 +752,9 @@ def _bearer_ok(ctx: PlatformContext, request: Request) -> bool:
         return True
     if not ctx.api_key_pepper:
         return False
-    return ctx.state.key_is_active(key_digest(token, ctx.api_key_pepper))
+    return await run_in_threadpool(
+        ctx.state.key_is_active, key_digest(token, ctx.api_key_pepper)
+    )
 
 
 def _admin_ok(ctx: PlatformContext, request: Request) -> bool:
@@ -754,7 +834,10 @@ def _provenance_headers(ctx: PlatformContext) -> dict[str, str]:
 
 
 def _response_headers(
-    response: httpx.Response, ctx: PlatformContext | None = None
+    response: httpx.Response,
+    ctx: PlatformContext | None = None,
+    *,
+    request_id: str | None = None,
 ) -> dict[str, str]:
     """Forward the miner's allow-listed headers, then stamp our own provenance."""
     headers = {
@@ -764,6 +847,32 @@ def _response_headers(
     }
     if ctx is not None:
         headers.update(_provenance_headers(ctx))
+    if request_id is not None:
+        headers["X-Instant-Request-Id"] = request_id
+    return headers
+
+
+def _unverified_response_headers(
+    ctx: PlatformContext, *, request_id: str
+) -> dict[str, str]:
+    headers = _provenance_headers(ctx)
+    headers["X-Instant-Request-Id"] = request_id
+    return headers
+
+
+def _stream_response_headers(
+    response: httpx.Response, ctx: PlatformContext, *, request_id: str
+) -> dict[str, str]:
+    """Headers safe to expose before stream receipt verification completes."""
+    headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() in {"cache-control", "x-accel-buffering"}
+    }
+    headers.update(_provenance_headers(ctx))
+    # The platform generated this id. Never let an upstream miner stamp a
+    # conflicting value into a response whose receipt has not yet verified.
+    headers["X-Instant-Request-Id"] = request_id
     return headers
 
 

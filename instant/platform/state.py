@@ -7,11 +7,17 @@ import math
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Literal
 
 from ..protocol import receipts
 from ..protocol.schemas import MinerStatsWindow, StatsResponse
 
 SCHEMA_VERSION = 2
+# An active request is omitted from a scoring snapshot. If the process crashed
+# before finishing it, the row becomes a failure after this grace period rather
+# than disappearing from telemetry forever. This is twice the deployed 300s
+# upstream timeout and still well inside the one-hour stats window.
+UNFINISHED_GRACE_MS = 10 * 60 * 1000
 
 #: Keys are 32 random bytes; the prefix is for display and lookup only, never
 #: for authentication. ``digest`` is an HMAC-SHA256 under a server-held pepper,
@@ -60,6 +66,14 @@ CREATE INDEX requests_by_window ON requests (miner_hotkey, started_ms);
 _MIGRATIONS: dict[int, str] = {1: _SCHEMA_KEYS}
 
 
+class KeyConflictError(ValueError):
+    """A key id and digest refer to different existing credentials."""
+
+
+class KeyRevokedError(ValueError):
+    """An exact registration retry refers to a permanently revoked key."""
+
+
 class PlatformState:
     """One SQLite connection protected for FastAPI/TestClient thread handoff."""
 
@@ -86,19 +100,43 @@ class PlatformState:
         digest: str,
         label: str,
         created_ms: int,
-    ) -> None:
-        """Record a key the control plane has issued. Idempotent per digest."""
+    ) -> Literal["registered", "already_registered"]:
+        """Record one exact key-id/digest pair, safely retrying lost responses.
+
+        A retry of the same active pair is idempotent. Reusing either the id or
+        digest for a different credential is a conflict, and a revoked secret
+        can never be registered again.
+        """
         with self._lock, self._db:
+            by_id = self._db.execute(
+                "SELECT key_id, digest, revoked_ms FROM api_keys WHERE key_id=?",
+                (key_id,),
+            ).fetchone()
+            by_digest = self._db.execute(
+                "SELECT key_id, digest, revoked_ms FROM api_keys WHERE digest=?",
+                (digest,),
+            ).fetchone()
+            if by_id is not None or by_digest is not None:
+                same_pair = (
+                    by_id is not None
+                    and by_digest is not None
+                    and by_id["key_id"] == by_digest["key_id"] == key_id
+                    and by_id["digest"] == by_digest["digest"] == digest
+                )
+                if not same_pair:
+                    raise KeyConflictError(
+                        "key_id or key digest is already registered to another key"
+                    )
+                if by_id["revoked_ms"] is not None:
+                    raise KeyRevokedError("this key was revoked and cannot be reused")
+                return "already_registered"
             self._db.execute(
                 "INSERT INTO api_keys "
                 "(key_id, prefix, last4, digest, label, created_ms, revoked_ms) "
-                "VALUES (?,?,?,?,?,?,NULL) "
-                # Idempotent for retries, but deliberately does NOT clear
-                # revoked_ms: registering a key must never be able to undo a
-                # revocation. A revoked secret stays dead; mint a new one.
-                "ON CONFLICT(digest) DO UPDATE SET label=excluded.label",
+                "VALUES (?,?,?,?,?,?,NULL)",
                 (key_id, prefix, last4, digest, label, int(created_ms)),
             )
+            return "registered"
 
     def revoke_key(self, *, key_id: str, revoked_ms: int) -> bool:
         """Revoke by id. Returns False if the key is unknown or already revoked."""
@@ -213,8 +251,14 @@ class PlatformState:
         with self._lock:
             rows = self._db.execute(
                 "SELECT * FROM requests WHERE miner_hotkey=? AND started_ms>=? "
-                "AND started_ms<=? ORDER BY started_ms, request_id",
-                (miner_hotkey, int(window_start_ms), int(window_end_ms)),
+                "AND started_ms<=? AND (finished_ms IS NOT NULL OR started_ms<=?) "
+                "ORDER BY started_ms, request_id",
+                (
+                    miner_hotkey,
+                    int(window_start_ms),
+                    int(window_end_ms),
+                    int(generated_at_ms) - UNFINISHED_GRACE_MS,
+                ),
             ).fetchall()
 
         requests_count = len(rows)
@@ -238,11 +282,6 @@ class PlatformState:
                 # do not count it as verified or commit it into the root.
                 continue
 
-        attestation_ids = {
-            item.receipt.attestation_id
-            for item in signed_receipts
-            if item.receipt.attestation_id
-        }
         miner = MinerStatsWindow(
             hotkey=miner_hotkey,
             uid=miner_uid,
@@ -264,15 +303,12 @@ class PlatformState:
             ),
             receipts_seen=sum(int(row["receipt_seen"]) for row in rows),
             receipts_verified=len(signed_receipts),
-            attestation_ok=(
-                bool(successes)
-                and len(signed_receipts) == successes
-                and all(item.receipt.attestation_id for item in signed_receipts)
-                and len(attestation_ids) == 1
-            ),
-            attestation_id=next(iter(attestation_ids))
-            if len(attestation_ids) == 1
-            else None,
+            # A miner-signed receipt can name any attestation id. Until a
+            # separate verifier persists fresh hardware evidence bound to this
+            # miner/model, repeating that id proves nothing and must never turn
+            # a public TEE indicator green.
+            attestation_ok=False,
+            attestation_id=None,
         )
         return StatsResponse(
             window_start_ms=window_start_ms,
@@ -296,9 +332,7 @@ def open_state(path: str | Path) -> PlatformState:
         db.execute("PRAGMA journal_mode=WAL")
         version = int(db.execute("PRAGMA user_version").fetchone()[0])
         if version == 0:
-            with db:
-                db.executescript(_SCHEMA)
-                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            _apply_schema(db, _SCHEMA, SCHEMA_VERSION)
         elif version > SCHEMA_VERSION:
             # Forward-dated database: this binary is older than the one that
             # wrote it. Refuse rather than guess at a schema we do not know.
@@ -315,13 +349,32 @@ def open_state(path: str | Path) -> PlatformState:
                         f"no migration from platform database schema {step}; "
                         f"cannot reach {SCHEMA_VERSION}"
                     )
-                with db:
-                    db.executescript(script)
-                    db.execute(f"PRAGMA user_version={step + 1}")
+                _apply_schema(db, script, step + 1)
     except Exception:
         db.close()
         raise
     return PlatformState(db)
+
+
+def _apply_schema(db: sqlite3.Connection, script: str, version: int) -> None:
+    """Apply DDL and its version marker in one explicit SQLite transaction.
+
+    ``executescript`` commits before executing its input, even inside a Python
+    connection context manager. Putting BEGIN/COMMIT inside the script is what
+    prevents a failed migration from leaving half-created tables behind while
+    ``user_version`` still names the old schema.
+    """
+    try:
+        db.executescript(
+            "BEGIN IMMEDIATE;\n"
+            f"{script}\n"
+            f"PRAGMA user_version={int(version)};\n"
+            "COMMIT;"
+        )
+    except Exception:
+        if db.in_transaction:
+            db.rollback()
+        raise
 
 
 def _percentile(values: list[int], percent: int) -> int:

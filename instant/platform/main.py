@@ -21,6 +21,14 @@ from .state import open_state
 log = logging.getLogger("instant.platform")
 
 
+def _required_secret(name: str) -> str:
+    """Load a runtime secret without ever including its value in diagnostics."""
+    value = os.environ.get(name, "")
+    if len(value) < 32:
+        raise ValueError(f"{name} must be configured with at least 32 characters")
+    return value
+
+
 async def _check_miner(ctx: PlatformContext) -> tuple[bool, dict]:
     try:
         health_response = await ctx.http.get(f"{ctx.miner_url}/health")
@@ -76,6 +84,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings()
         warnings = enforce(settings, role="platform")
+        # Validate these before --check returns. Otherwise a deploy can pass its
+        # preflight and boot a gateway whose customer-key admin routes are dead.
+        api_key_pepper = _required_secret("INSTANT_PLATFORM_API_KEY_PEPPER")
+        admin_token = _required_secret("INSTANT_PLATFORM_ADMIN_TOKEN")
     except Exception as exc:  # noqa: BLE001
         log.error("configuration error: %s", exc)
         return 2
@@ -103,10 +115,9 @@ def main(argv: list[str] | None = None) -> int:
             http=httpx.AsyncClient(timeout=settings.request_timeout_s),
             state=open_state(settings.platform_state_db),
             api_key_sha256=settings.platform_api_key_sha256,
-            # Read straight from the environment, never through Settings:
-            # Settings is logged by describe(), and these are credentials.
-            api_key_pepper=os.environ.get("INSTANT_PLATFORM_API_KEY_PEPPER", ""),
-            admin_token=os.environ.get("INSTANT_PLATFORM_ADMIN_TOKEN", ""),
+            # Kept out of Settings because describe(settings) is logged.
+            api_key_pepper=api_key_pepper,
+            admin_token=admin_token,
             validator_hotkeys=frozenset({settings.platform_validator_ss58}),
             miner_uid=settings.platform_miner_uid,
             stats_window_s=settings.platform_stats_window_s,

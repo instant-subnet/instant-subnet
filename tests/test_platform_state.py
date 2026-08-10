@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from instant.platform.state import open_state
+from instant.platform.state import UNFINISHED_GRACE_MS, KeyRevokedError, open_state
 from instant.protocol import receipts
 
 
@@ -62,7 +62,9 @@ def test_platform_telemetry_survives_reopen(tmp_path, miner_key, platform_key):
     assert (miner.ttft_p50_ms, miner.ttft_p95_ms) == (25, 25)
     assert (miner.tokens_per_s_p50, miner.tokens_per_s_p95) == (110, 110)
     assert (miner.receipts_seen, miner.receipts_verified) == (1, 1)
-    assert miner.attestation_ok is True
+    # A miner-supplied attestation id is not verified hardware evidence.
+    assert miner.attestation_ok is False
+    assert miner.attestation_id is None
     assert stats.receipt_merkle_root == receipts.merkle_root([signed])
 
 
@@ -129,7 +131,7 @@ def test_stats_invariants_and_nearest_rank_percentiles(
     assert stats.ttft_p95_ms == 20
 
 
-def test_an_unfinished_attempt_is_a_failure_not_forgotten(tmp_path, miner_key):
+def test_an_unfinished_attempt_is_excluded_until_it_closes(tmp_path, miner_key):
     state = open_state(tmp_path / "pending.sqlite3")
     state.begin(
         request_id="interrupted",
@@ -143,6 +145,26 @@ def test_an_unfinished_attempt_is_a_failure_not_forgotten(tmp_path, miner_key):
         window_start_ms=0,
         window_end_ms=2_000,
         generated_at_ms=2_000,
+    ).miners[0]
+    state.close()
+    assert (stats.requests, stats.successes, stats.failures) == (0, 0, 0)
+
+
+def test_a_stale_unfinished_attempt_eventually_counts_as_failure(tmp_path, miner_key):
+    state = open_state(tmp_path / "stale-pending.sqlite3")
+    state.begin(
+        request_id="crash-orphan",
+        miner_hotkey=miner_key.ss58_address,
+        started_ms=1_000,
+        stream=True,
+    )
+    generated_at = 1_000 + UNFINISHED_GRACE_MS + 1
+    stats = state.stats(
+        miner_hotkey=miner_key.ss58_address,
+        miner_uid=0,
+        window_start_ms=0,
+        window_end_ms=generated_at,
+        generated_at_ms=generated_at,
     ).miners[0]
     state.close()
     assert (stats.requests, stats.successes, stats.failures) == (1, 0, 1)
@@ -195,6 +217,38 @@ def test_a_future_schema_is_refused_rather_than_guessed(tmp_path):
         open_state(path)
 
 
+def test_a_failed_migration_rolls_back_ddl_and_version(tmp_path, monkeypatch):
+    import sqlite3
+
+    from instant.platform import state as state_mod
+
+    path = tmp_path / "broken-v1.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript(state_mod._SCHEMA.replace(state_mod._SCHEMA_KEYS, ""))
+    db.execute("PRAGMA user_version=1")
+    db.commit()
+    db.close()
+
+    monkeypatch.setitem(
+        state_mod._MIGRATIONS,
+        1,
+        "CREATE TABLE must_rollback (value TEXT); THIS IS NOT SQL;",
+    )
+    with pytest.raises(sqlite3.DatabaseError):
+        open_state(path)
+
+    check = sqlite3.connect(path)
+    try:
+        version = check.execute("PRAGMA user_version").fetchone()[0]
+        table = check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='must_rollback'"
+        ).fetchone()
+    finally:
+        check.close()
+    assert version == 1
+    assert table is None
+
+
 def test_registering_a_revoked_digest_does_not_resurrect_it(tmp_path):
     """Registration must never undo a revocation, or revoke is bypassable."""
     state = open_state(tmp_path / "keys.sqlite3")
@@ -206,8 +260,15 @@ def test_registering_a_revoked_digest_does_not_resurrect_it(tmp_path):
         assert state.revoke_key(key_id="k1", revoked_ms=2)
         assert not state.key_is_active(digest)
 
-        state.register_key(key_id="k1", prefix="isk_aaaa", last4="zzzz",
-                           digest=digest, label="second", created_ms=3)
+        with pytest.raises(KeyRevokedError):
+            state.register_key(
+                key_id="k1",
+                prefix="isk_aaaa",
+                last4="zzzz",
+                digest=digest,
+                label="second",
+                created_ms=3,
+            )
         assert not state.key_is_active(digest), "a revoked key came back to life"
     finally:
         state.close()

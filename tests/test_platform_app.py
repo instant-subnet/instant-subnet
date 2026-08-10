@@ -57,6 +57,9 @@ def miner_app(miner_key, platform_key):
     app.state.requests = []
     app.state.corrupt_receipt = False
     app.state.spoof_provenance = False
+    app.state.empty_receipt_event = False
+    app.state.unknown_stream_event = False
+    app.state.data_error = False
 
     @app.get("/health")
     async def health():
@@ -106,17 +109,26 @@ def miner_app(miner_key, platform_key):
                 signed.signature = "00" * 64
 
             async def chunks():
+                yield b": keep-alive\n\n"
                 yield b"data: " + data + b"\n\n"
-                yield b"data: [DONE]\n\n"
+                if app.state.unknown_stream_event:
+                    yield b"event: bonus\ndata: uncommitted customer bytes\n\n"
+                if app.state.empty_receipt_event:
+                    yield b"event: receipt\n\n"
+                if app.state.data_error:
+                    yield b'data: {"error":{"message":"upstream failed"}}\n\n'
                 yield (
                     b"event: receipt\ndata: "
                     + json.dumps(signed.to_payload(), separators=(",", ":")).encode()
                     + b"\n\n"
                 )
+                yield b"data: [DONE]\n\n"
 
             stream_headers = {
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
+                receipts.H_RECEIPT: "unverified-header-receipt",
+                receipts.H_RECEIPT_SIG: "unverified-header-signature",
             }
             stream_headers.update(_spoofed(app))
             return StreamingResponse(
@@ -244,7 +256,7 @@ def test_nonstream_request_is_signed_and_receipt_verified(
     assert (stats["prompt_tokens"], stats["completion_tokens"]) == (2, 3)
 
 
-def test_invalid_receipt_is_forwarded_but_counts_as_failure(
+def test_invalid_receipt_fails_closed_and_counts_as_failure(
     client, miner_app, validator_key, platform_key
 ):
     miner_app.state.corrupt_receipt = True
@@ -253,13 +265,16 @@ def test_invalid_receipt_is_forwarded_but_counts_as_failure(
         content=body_for(),
         headers={"content-type": "application/json"},
     )
-    assert response.status_code == 200
+    assert response.status_code == 502
+    assert response.json()["error"] == "invalid_miner_receipt"
+    assert receipts.H_RECEIPT not in response.headers
+    assert receipts.H_RECEIPT_SIG not in response.headers
     stats = _stats(client, validator_key, platform_key).json()["miners"][0]
     assert (stats["successes"], stats["failures"]) == (0, 1)
     assert (stats["receipts_seen"], stats["receipts_verified"]) == (1, 0)
 
 
-def test_stream_relay_keeps_receipt_and_records_external_metrics(
+def test_stream_relay_hides_internal_receipt_and_records_before_done(
     client, validator_key, platform_key
 ):
     response = client.post(
@@ -268,15 +283,104 @@ def test_stream_relay_keeps_receipt_and_records_external_metrics(
         headers={"content-type": "application/json"},
     )
     assert response.status_code == 200
-    assert "data: [DONE]" in response.text
-    assert "event: receipt" in response.text
+    assert response.text.count("data: [DONE]") == 1
+    assert "event: receipt" not in response.text
     assert response.headers["cache-control"] == "no-cache"
     assert response.headers["x-accel-buffering"] == "no"
+    assert receipts.H_RECEIPT not in response.headers
+    assert receipts.H_RECEIPT_SIG not in response.headers
+    assert response.headers["x-instant-request-id"]
 
     stats = _stats(client, validator_key, platform_key).json()["miners"][0]
     assert stats["successes"] == 1
     assert stats["ttft_p95_ms"] >= 0
     assert stats["tokens_per_s_p50"] >= 0
+
+
+def test_corrupt_stream_receipt_never_publishes_done(client, miner_app):
+    miner_app.state.corrupt_receipt = True
+    response = client.post(
+        "/v1/chat/completions",
+        content=body_for(stream=True),
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 200  # headers were already streamed
+    assert "data: [DONE]" not in response.text
+    assert "invalid_miner_receipt" in response.text
+    assert "event: receipt" not in response.text
+
+
+@pytest.mark.parametrize(
+    "fault", ["unknown_stream_event", "empty_receipt_event", "data_error"]
+)
+def test_uncommitted_or_malformed_stream_events_fail_closed(client, miner_app, fault):
+    setattr(miner_app.state, fault, True)
+    response = client.post(
+        "/v1/chat/completions",
+        content=body_for(stream=True),
+        headers={"content-type": "application/json"},
+    )
+    assert "data: [DONE]" not in response.text
+    assert "invalid_miner_receipt" in response.text
+    assert "uncommitted customer bytes" not in response.text
+    assert "event: receipt" not in response.text
+
+
+def test_stream_heartbeats_are_preserved(client):
+    response = client.post(
+        "/v1/chat/completions",
+        content=body_for(stream=True),
+        headers={"content-type": "application/json"},
+    )
+    assert ": keep-alive\n\n" in response.text
+    assert "data: [DONE]" in response.text
+
+
+async def test_openai_sdk_stops_at_done_after_telemetry_is_committed(
+    miner_app, miner_key, platform_key, validator_key, tmp_path
+):
+    AsyncOpenAI = pytest.importorskip("openai").AsyncOpenAI
+    ctx = platform_context(
+        miner_app,
+        miner_key,
+        platform_key,
+        validator_key,
+        tmp_path / "sdk.sqlite3",
+    )
+    app = create_app(ctx)
+    http = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://platform",
+    )
+    sdk = AsyncOpenAI(
+        base_url="http://platform/v1",
+        api_key=API_KEY,
+        http_client=http,
+    )
+    try:
+        stream = await sdk.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+        )
+        content = ""
+        async for chunk in stream:
+            content += chunk.choices[0].delta.content or ""
+        assert content == "hi"
+
+        generated_at = int(time.time() * 1000)
+        stats = ctx.state.stats(
+            miner_hotkey=miner_key.ss58_address,
+            miner_uid=7,
+            window_start_ms=0,
+            window_end_ms=generated_at,
+            generated_at_ms=generated_at,
+        ).miners[0]
+        assert (stats.requests, stats.successes, stats.receipts_verified) == (1, 1, 1)
+    finally:
+        await sdk.close()
+        await ctx.http.aclose()
+        ctx.state.close()
 
 
 def test_stats_requires_epistula_and_signs_exact_response_bytes(
@@ -623,16 +727,87 @@ def test_the_service_credential_still_works_alongside_minted_keys(client):
     assert client.post("/v1/chat/completions", content=body_for()).status_code == 200
 
 
-def test_a_key_from_another_pepper_is_rejected(client, miner_app, miner_key, platform_key, validator_key, tmp_path):
-    """The pepper is what stops a stolen digest being replayed elsewhere."""
-    _register(client, CUSTOMER_KEY)
-    other = platform_context(
-        miner_app, miner_key, platform_key, validator_key, tmp_path / "other.sqlite3"
-    )
-    other.api_key_pepper = "a-different-pepper"
-    with TestClient(create_app(other)) as c2:
-        c2.post("/admin/v1/keys", json={"key": CUSTOMER_KEY, "key_id": "k_1"}, headers=ADMIN)
-        # Same raw key, different pepper -> a different digest entirely.
-        from instant.platform.app import key_digest
+def test_exact_key_registration_is_retry_safe_but_collisions_are_conflicts(client):
+    created = _register(client, CUSTOMER_KEY, key_id="stable")
+    assert created.status_code == 201
+    assert created.json()["status"] == "registered"
 
-        assert key_digest(CUSTOMER_KEY, PEPPER) != key_digest(CUSTOMER_KEY, "a-different-pepper")
+    retry = _register(client, CUSTOMER_KEY, key_id="stable")
+    assert retry.status_code == 200
+    assert retry.json() == {"key_id": "stable", "status": "already_registered"}
+
+    digest_collision = _register(client, CUSTOMER_KEY, key_id="different-id")
+    id_collision = _register(
+        client,
+        "isk_a_completely_different_customer_key",
+        key_id="stable",
+    )
+    assert digest_collision.status_code == id_collision.status_code == 409
+    assert digest_collision.json()["error"] == "key_conflict"
+    assert id_collision.json()["error"] == "key_conflict"
+
+
+def test_revoked_key_registration_retry_is_refused(client):
+    assert _register(client, CUSTOMER_KEY, key_id="dead").status_code == 201
+    assert client.delete("/admin/v1/keys/dead", headers=ADMIN).status_code == 200
+    retry = _register(client, CUSTOMER_KEY, key_id="dead")
+    assert retry.status_code == 409
+    assert retry.json()["error"] == "key_revoked"
+
+
+def test_dynamic_key_lookup_does_not_run_on_the_event_loop(
+    client, monkeypatch
+):
+    import threading
+
+    from instant.platform import app as app_module
+
+    assert _register(client, CUSTOMER_KEY).status_code == 201
+    loop_threads: set[int] = set()
+    lookup_threads: set[int] = set()
+    real_now = app_module._now_ms
+    real_lookup = client.app.state.ctx.state.key_is_active
+
+    def spy_now() -> int:
+        loop_threads.add(threading.get_ident())
+        return real_now()
+
+    def spy_lookup(digest: str) -> bool:
+        lookup_threads.add(threading.get_ident())
+        return real_lookup(digest)
+
+    monkeypatch.setattr(app_module, "_now_ms", spy_now)
+    monkeypatch.setattr(client.app.state.ctx.state, "key_is_active", spy_lookup)
+    response = client.post(
+        "/v1/chat/completions",
+        content=body_for(),
+        headers={"authorization": f"Bearer {CUSTOMER_KEY}"},
+    )
+    assert response.status_code == 200
+    assert loop_threads and lookup_threads
+    assert loop_threads.isdisjoint(lookup_threads)
+
+
+def test_a_key_from_another_pepper_is_rejected(client):
+    """The pepper is what stops a stolen digest being replayed elsewhere."""
+    assert _register(client, CUSTOMER_KEY).status_code == 201
+    client.app.state.ctx.api_key_pepper = "a-different-pepper"
+    response = client.post(
+        "/v1/chat/completions",
+        content=body_for(),
+        headers={"authorization": f"Bearer {CUSTOMER_KEY}"},
+    )
+    assert response.status_code == 401
+
+
+def test_runtime_key_secrets_are_required_even_for_preflight(monkeypatch):
+    from instant.platform.main import _required_secret
+
+    monkeypatch.delenv("INSTANT_TEST_SECRET", raising=False)
+    with pytest.raises(ValueError, match="INSTANT_TEST_SECRET"):
+        _required_secret("INSTANT_TEST_SECRET")
+    monkeypatch.setenv("INSTANT_TEST_SECRET", "short")
+    with pytest.raises(ValueError, match="at least 32"):
+        _required_secret("INSTANT_TEST_SECRET")
+    monkeypatch.setenv("INSTANT_TEST_SECRET", "x" * 32)
+    assert _required_secret("INSTANT_TEST_SECRET") == "x" * 32
