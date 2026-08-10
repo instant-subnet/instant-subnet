@@ -12,7 +12,7 @@ from typing import Literal
 from ..protocol import receipts
 from ..protocol.schemas import MinerStatsWindow, StatsResponse
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # An active request is omitted from a scoring snapshot. If the process crashed
 # before finishing it, the row becomes a failure after this grace period rather
 # than disappearing from telemetry forever. This is twice the deployed 300s
@@ -35,7 +35,7 @@ CREATE TABLE api_keys (
 CREATE INDEX api_keys_by_digest ON api_keys (digest);
 """
 
-_SCHEMA = """
+_SCHEMA_REQUESTS_V1 = """
 CREATE TABLE requests (
     request_id       TEXT PRIMARY KEY,
     miner_hotkey     TEXT    NOT NULL,
@@ -56,14 +56,78 @@ CREATE TABLE requests (
     error            TEXT
 );
 CREATE INDEX requests_by_window ON requests (miner_hotkey, started_ms);
-""" + _SCHEMA_KEYS
+"""
+
+_SCHEMA_REQUESTS = """
+CREATE TABLE requests (
+    request_id       TEXT PRIMARY KEY,
+    miner_hotkey     TEXT    NOT NULL,
+    started_ms       INTEGER NOT NULL,
+    finished_ms      INTEGER,
+    stream           INTEGER NOT NULL,
+    status_code      INTEGER,
+    success          INTEGER NOT NULL DEFAULT 0,
+    clean_reject     INTEGER NOT NULL DEFAULT 0,
+    ttft_ms          INTEGER,
+    total_ms         INTEGER,
+    tps_milli        INTEGER,
+    prompt_tokens    INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    receipt_json     TEXT,
+    receipt_seen     INTEGER NOT NULL DEFAULT 0,
+    receipt_verified INTEGER NOT NULL DEFAULT 0,
+    error            TEXT,
+    api_key_id       TEXT
+);
+CREATE INDEX requests_by_window ON requests (miner_hotkey, started_ms);
+CREATE INDEX requests_by_api_key ON requests (api_key_id, started_ms);
+"""
+
+_SCHEMA = _SCHEMA_REQUESTS + _SCHEMA_KEYS
 
 #: Upgrades from an older on-disk schema, applied in order. Without this the
 #: gateway refuses to open a database written by a previous version, which
 #: would mean discarding the request and receipt history that validator scoring
 #: reads. Each step must be additive: a migration that rewrites rows can lose
 #: evidence a miner has already been paid for.
-_MIGRATIONS: dict[int, str] = {1: _SCHEMA_KEYS}
+_MIGRATIONS: dict[int, str] = {
+    1: _SCHEMA_KEYS,
+    2: """
+ALTER TABLE requests ADD COLUMN api_key_id TEXT;
+CREATE INDEX requests_by_api_key ON requests (api_key_id, started_ms);
+""",
+}
+
+_KEY_USAGE_SELECT = """
+SELECT
+    k.key_id,
+    k.prefix,
+    k.last4,
+    k.label,
+    k.created_ms,
+    k.revoked_ms,
+    MAX(r.started_ms) AS last_used_ms,
+    COUNT(r.request_id) AS requests,
+    COALESCE(SUM(CASE WHEN r.success=1 THEN 1 ELSE 0 END), 0)
+        AS successful_requests,
+    COALESCE(SUM(
+        CASE WHEN r.success=1 AND r.receipt_verified=1 THEN 1 ELSE 0 END
+    ), 0) AS verified_requests,
+    COALESCE(SUM(
+        CASE WHEN r.success=1 AND r.receipt_verified=1
+             THEN r.prompt_tokens ELSE 0 END
+    ), 0) AS prompt_tokens,
+    COALESCE(SUM(
+        CASE WHEN r.success=1 AND r.receipt_verified=1
+             THEN r.completion_tokens ELSE 0 END
+    ), 0) AS completion_tokens
+FROM api_keys AS k
+LEFT JOIN requests AS r ON r.api_key_id = k.key_id
+"""
+_KEY_USAGE_GROUP = """
+GROUP BY
+    k.key_id, k.prefix, k.last4, k.label, k.created_ms, k.revoked_ms
+"""
 
 
 class KeyConflictError(ValueError):
@@ -148,22 +212,43 @@ class PlatformState:
             )
             return cur.rowcount > 0
 
-    def key_is_active(self, digest: str) -> bool:
-        """True when this digest names a key that exists and is not revoked."""
+    def active_key_id(self, digest: str) -> str | None:
+        """Return the opaque id for an active digest, without exposing secrets."""
         with self._lock:
             row = self._db.execute(
-                "SELECT 1 FROM api_keys WHERE digest=? AND revoked_ms IS NULL",
+                "SELECT key_id FROM api_keys WHERE digest=? AND revoked_ms IS NULL",
                 (digest,),
             ).fetchone()
-        return row is not None
+        return str(row["key_id"]) if row is not None else None
+
+    def key_is_active(self, digest: str) -> bool:
+        """Compatibility predicate for callers that do not need attribution."""
+        return self.active_key_id(digest) is not None
 
     def list_keys(self) -> list[dict]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT key_id, prefix, last4, label, created_ms, revoked_ms "
-                "FROM api_keys ORDER BY created_ms, key_id"
+                _KEY_USAGE_SELECT
+                + _KEY_USAGE_GROUP
+                + " ORDER BY k.created_ms, k.key_id"
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [_usage_dict(row) for row in rows]
+
+    def key_usage(self, key_id: str) -> dict | None:
+        """Return lifetime, receipt-backed usage for one opaque key id.
+
+        Revocation does not erase history. ``last_used_ms`` names the latest
+        accepted and validated chat request, including failed attempts. Token
+        totals are stricter: only successful rows whose miner receipt verified
+        contribute, so an error body or an unverified miner claim can never
+        inflate customer usage.
+        """
+        with self._lock:
+            row = self._db.execute(
+                _KEY_USAGE_SELECT + " WHERE k.key_id=?" + _KEY_USAGE_GROUP,
+                (key_id,),
+            ).fetchone()
+        return _usage_dict(row) if row is not None else None
 
     def begin(
         self,
@@ -172,12 +257,20 @@ class PlatformState:
         miner_hotkey: str,
         started_ms: int,
         stream: bool,
+        api_key_id: str | None = None,
     ) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO requests (request_id, miner_hotkey, started_ms, stream) "
-                "VALUES (?,?,?,?)",
-                (request_id, miner_hotkey, int(started_ms), int(stream)),
+                "INSERT INTO requests "
+                "(request_id, miner_hotkey, started_ms, stream, api_key_id) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    request_id,
+                    miner_hotkey,
+                    int(started_ms),
+                    int(stream),
+                    api_key_id,
+                ),
             )
 
     def finish(
@@ -375,6 +468,26 @@ def _apply_schema(db: sqlite3.Connection, script: str, version: int) -> None:
         if db.in_transaction:
             db.rollback()
         raise
+
+
+def _usage_dict(row: sqlite3.Row) -> dict:
+    payload = dict(row)
+    for field in (
+        "created_ms",
+        "requests",
+        "successful_requests",
+        "verified_requests",
+        "prompt_tokens",
+        "completion_tokens",
+    ):
+        payload[field] = int(payload[field])
+    for field in ("revoked_ms", "last_used_ms"):
+        if payload[field] is not None:
+            payload[field] = int(payload[field])
+    payload["total_tokens"] = (
+        payload["prompt_tokens"] + payload["completion_tokens"]
+    )
+    return payload
 
 
 def _percentile(values: list[int], percent: int) -> int:

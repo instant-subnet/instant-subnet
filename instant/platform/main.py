@@ -119,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
             api_key_pepper=api_key_pepper,
             admin_token=admin_token,
             validator_hotkeys=frozenset({settings.platform_validator_ss58}),
+            model_max_len=settings.model_max_len,
             miner_uid=settings.platform_miner_uid,
             stats_window_s=settings.platform_stats_window_s,
         )

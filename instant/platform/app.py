@@ -48,6 +48,10 @@ class PlatformContext:
     state: PlatformState
     api_key_sha256: str
     validator_hotkeys: frozenset[str]
+    #: Hard ceiling used to reject impossible miner-reported token counts.
+    #: The signed receipt binds a count to the response; it does not make an
+    #: out-of-range value true.
+    model_max_len: int = 131_072
     miner_uid: int = 0
     stats_window_s: int = 3600
     # How long one computed public stats body is reused. Injectable so tests
@@ -72,10 +76,24 @@ class PlatformContext:
             raise ValueError("api_key_sha256 must be a SHA-256 hex digest")
         if self.miner_uid < 0:
             raise ValueError("miner_uid must be non-negative")
+        if self.model_max_len < 1:
+            raise ValueError("model_max_len must be positive")
         if self.stats_window_s < 1:
             raise ValueError("stats_window_s must be positive")
         if self.public_stats_ttl_s < 0:
             raise ValueError("public_stats_ttl_s must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class _ApiPrincipal:
+    """Authenticated caller identity safe to persist with telemetry.
+
+    The legacy environment credential intentionally has no customer key id.
+    A dashboard-issued key carries only its opaque id; the raw credential and
+    digest never enter a request row.
+    """
+
+    api_key_id: str | None
 
 
 def create_app(ctx: PlatformContext) -> FastAPI:
@@ -131,7 +149,7 @@ def create_app(ctx: PlatformContext) -> FastAPI:
 
     @app.get("/v1/models")
     async def models(request: Request) -> Response:
-        if not await _bearer_ok(ctx, request):
+        if await _authenticate_bearer(ctx, request) is None:
             return _bearer_error()
         try:
             response = await ctx.http.get(f"{ctx.miner_url}/manifest")
@@ -166,7 +184,8 @@ def create_app(ctx: PlatformContext) -> FastAPI:
     async def chat_completions(request: Request) -> Response:
         # Authenticate before reading, validating, signing, or forwarding a
         # potentially large request body.
-        if not await _bearer_ok(ctx, request):
+        principal = await _authenticate_bearer(ctx, request)
+        if principal is None:
             return _bearer_error()
 
         raw = await request.body()
@@ -189,6 +208,7 @@ def create_app(ctx: PlatformContext) -> FastAPI:
             miner_hotkey=ctx.miner_ss58,
             started_ms=started_ms,
             stream=parsed.stream,
+            api_key_id=principal.api_key_id,
         )
         headers = {
             "Content-Type": "application/json",
@@ -463,11 +483,26 @@ def create_app(ctx: PlatformContext) -> FastAPI:
 
     @app.get("/admin/v1/keys")
     async def admin_list_keys(request: Request) -> Response:
-        """Digests are never returned -- only what is safe to display."""
+        """Safe key metadata and receipt-backed lifetime usage; never digests."""
         if not _admin_ok(ctx, request):
             return _error(401, "unauthorized", "admin token required")
         keys = await run_in_threadpool(ctx.state.list_keys)
         return JSONResponse({"keys": keys})
+
+    @app.get("/admin/v1/keys/{key_id}/usage")
+    async def admin_key_usage(key_id: str, request: Request) -> Response:
+        """Return one key's lifetime usage, including after it is revoked.
+
+        The control plane asks only for ids already owned by its signed-in
+        user. Echoing the stored prefix and last four characters lets it reject
+        an accidental id mismatch without exposing a credential or digest.
+        """
+        if not _admin_ok(ctx, request):
+            return _error(401, "unauthorized", "admin token required")
+        usage = await run_in_threadpool(ctx.state.key_usage, key_id)
+        if usage is None:
+            return _error(404, "not_found", "no key with that id")
+        return JSONResponse(usage)
 
     @app.get("/validator/v1/stats")
     async def validator_stats(request: Request) -> Response:
@@ -716,10 +751,49 @@ def _verify_receipt(
         response_body=response_body,
     )
     receipt = signed.receipt
+    _validate_receipt_token_counts(ctx, receipt, request_body=request_body)
     if receipt.request_id != request_id:
         raise receipts.ReceiptError("receipt request id does not match")
     if receipt.signer_of_request != ctx.signer.ss58_address:
         raise receipts.ReceiptError("receipt names a different request signer")
+
+
+def _validate_receipt_token_counts(
+    ctx: PlatformContext,
+    receipt: receipts.Receipt,
+    *,
+    request_body: bytes,
+) -> None:
+    """Reject impossible receipt counters before they reach SQLite or TPS.
+
+    Counts remain miner-reported until independent tokenization or an attested
+    inference worker is in place. These bounds are still load-bearing: a
+    signed negative or arbitrarily large integer must not become plausible UI
+    telemetry, overflow SQLite, or distort observed-throughput calculations.
+    """
+    counts = (receipt.prompt_tokens, receipt.completion_tokens)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in counts):
+        raise receipts.ReceiptError("receipt token counts must be integers")
+    if any(value < 0 for value in counts):
+        raise receipts.ReceiptError("receipt token counts must be non-negative")
+    if any(value > ctx.model_max_len for value in counts):
+        raise receipts.ReceiptError("receipt token count exceeds model context")
+    if sum(counts) > ctx.model_max_len:
+        raise receipts.ReceiptError("receipt total tokens exceed model context")
+
+    try:
+        parsed = ChatCompletionRequest.model_validate_json(request_body)
+    except ValueError as exc:
+        # The route has already validated this body. Failing closed here keeps
+        # the evidence check correct if a future caller bypasses that route.
+        raise receipts.ReceiptError("receipt request body is not a valid request") from exc
+    requested_limits = [
+        value
+        for value in (parsed.max_tokens, parsed.max_completion_tokens)
+        if value is not None
+    ]
+    if requested_limits and receipt.completion_tokens > min(requested_limits):
+        raise receipts.ReceiptError("receipt completion tokens exceed request limit")
 
 
 def key_digest(token: str, pepper: str) -> str:
@@ -740,21 +814,24 @@ def _bearer_token(request: Request) -> str | None:
     return token
 
 
-async def _bearer_ok(ctx: PlatformContext, request: Request) -> bool:
+async def _authenticate_bearer(
+    ctx: PlatformContext, request: Request
+) -> _ApiPrincipal | None:
     token = _bearer_token(request)
     if token is None:
-        return False
+        return None
     # The env key is the control plane's service credential, checked first and
     # in constant time so an empty key table never locks the gateway out.
     if hmac.compare_digest(
         hashlib.sha256(token.encode()).hexdigest(), ctx.api_key_sha256
     ):
-        return True
+        return _ApiPrincipal(api_key_id=None)
     if not ctx.api_key_pepper:
-        return False
-    return await run_in_threadpool(
-        ctx.state.key_is_active, key_digest(token, ctx.api_key_pepper)
+        return None
+    key_id = await run_in_threadpool(
+        ctx.state.active_key_id, key_digest(token, ctx.api_key_pepper)
     )
+    return _ApiPrincipal(api_key_id=key_id) if key_id is not None else None
 
 
 def _admin_ok(ctx: PlatformContext, request: Request) -> bool:

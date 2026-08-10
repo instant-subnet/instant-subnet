@@ -26,13 +26,16 @@ ADMIN = {"x-instant-admin-token": ADMIN_TOKEN}
 AUTH = {"authorization": f"Bearer {API_KEY}"}
 
 
-def body_for(*, stream: bool = False) -> bytes:
+def body_for(*, stream: bool = False, max_tokens: int | None = None) -> bytes:
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": stream,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     return json.dumps(
-        {
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": stream,
-        },
+        payload,
         separators=(",", ":"),
     ).encode()
 
@@ -60,6 +63,8 @@ def miner_app(miner_key, platform_key):
     app.state.empty_receipt_event = False
     app.state.unknown_stream_event = False
     app.state.data_error = False
+    app.state.prompt_tokens = None
+    app.state.completion_tokens = None
 
     @app.get("/health")
     async def health():
@@ -97,8 +102,16 @@ def miner_app(miner_key, platform_key):
                 signer_of_request=platform_key.ss58_address,
                 request_body=raw,
                 response_body=data,
-                prompt_tokens=1,
-                completion_tokens=1,
+                prompt_tokens=(
+                    1
+                    if app.state.prompt_tokens is None
+                    else app.state.prompt_tokens
+                ),
+                completion_tokens=(
+                    1
+                    if app.state.completion_tokens is None
+                    else app.state.completion_tokens
+                ),
                 ttft_ms_self=2,
                 total_ms_self=3,
                 started_at_ms=started,
@@ -144,8 +157,14 @@ def miner_app(miner_key, platform_key):
             signer_of_request=platform_key.ss58_address,
             request_body=raw,
             response_body=response_body,
-            prompt_tokens=2,
-            completion_tokens=3,
+            prompt_tokens=(
+                2 if app.state.prompt_tokens is None else app.state.prompt_tokens
+            ),
+            completion_tokens=(
+                3
+                if app.state.completion_tokens is None
+                else app.state.completion_tokens
+            ),
             ttft_ms_self=2,
             total_ms_self=3,
             started_at_ms=started,
@@ -684,6 +703,97 @@ def test_a_registered_key_is_accepted_for_inference(client):
     )
     assert after.status_code == 200
 
+    usage = client.get("/admin/v1/keys/k_1/usage", headers=ADMIN).json()
+    assert usage["key_id"] == "k_1"
+    assert usage["prefix"] == CUSTOMER_KEY[:8]
+    assert usage["last4"] == CUSTOMER_KEY[-4:]
+    assert isinstance(usage["last_used_ms"], int)
+    assert usage["requests"] == 1
+    assert usage["successful_requests"] == usage["verified_requests"] == 1
+    assert usage["prompt_tokens"] == 2
+    assert usage["completion_tokens"] == 3
+    assert usage["total_tokens"] == 5
+    assert "digest" not in usage
+    listed = client.get("/admin/v1/keys", headers=ADMIN).json()["keys"]
+    assert listed == [usage]
+
+
+def test_streaming_usage_is_attributed_to_the_authenticated_key(client):
+    assert _register(client, CUSTOMER_KEY).status_code == 201
+    auth = {
+        "authorization": f"Bearer {CUSTOMER_KEY}",
+        # A caller-provided identity hint must never override authentication.
+        "x-instant-api-key-id": "somebody-elses-key",
+    }
+    with client.stream(
+        "POST", "/v1/chat/completions", content=body_for(stream=True), headers=auth
+    ) as response:
+        assert response.status_code == 200
+        assert b"data: [DONE]" in b"".join(response.iter_bytes())
+
+    usage = client.get("/admin/v1/keys/k_1/usage", headers=ADMIN).json()
+    assert usage["requests"] == usage["verified_requests"] == 1
+    assert usage["prompt_tokens"] == 1
+    assert usage["completion_tokens"] == 1
+    assert usage["total_tokens"] == 2
+
+
+def test_unverified_failures_update_last_use_but_cannot_inflate_token_usage(
+    client, miner_app
+):
+    assert _register(client, CUSTOMER_KEY).status_code == 201
+    miner_app.state.corrupt_receipt = True
+    response = client.post(
+        "/v1/chat/completions",
+        content=body_for(),
+        headers={"authorization": f"Bearer {CUSTOMER_KEY}"},
+    )
+    assert response.status_code == 502
+
+    usage = client.get("/admin/v1/keys/k_1/usage", headers=ADMIN).json()
+    assert isinstance(usage["last_used_ms"], int)
+    assert usage["requests"] == 1
+    assert usage["successful_requests"] == usage["verified_requests"] == 0
+    assert usage["prompt_tokens"] == usage["completion_tokens"] == 0
+    assert usage["total_tokens"] == 0
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "completion_tokens", "body"),
+    [
+        (-1, 1, body_for()),
+        (131_072, 1, body_for()),
+        (1, 3, body_for(max_tokens=2)),
+    ],
+)
+def test_impossible_miner_token_counts_fail_closed(
+    client, miner_app, prompt_tokens, completion_tokens, body
+):
+    assert _register(client, CUSTOMER_KEY).status_code == 201
+    miner_app.state.prompt_tokens = prompt_tokens
+    miner_app.state.completion_tokens = completion_tokens
+
+    response = client.post(
+        "/v1/chat/completions",
+        content=body,
+        headers={"authorization": f"Bearer {CUSTOMER_KEY}"},
+    )
+
+    assert response.status_code == 502
+    usage = client.get("/admin/v1/keys/k_1/usage", headers=ADMIN).json()
+    assert usage["requests"] == 1
+    assert usage["verified_requests"] == 0
+    assert usage["total_tokens"] == 0
+
+
+def test_service_credential_requests_are_not_misattributed_to_customer_keys(client):
+    assert _register(client, CUSTOMER_KEY).status_code == 201
+    assert client.post("/v1/chat/completions", content=body_for()).status_code == 200
+
+    usage = client.get("/admin/v1/keys/k_1/usage", headers=ADMIN).json()
+    assert usage["last_used_ms"] is None
+    assert usage["requests"] == usage["total_tokens"] == 0
+
 
 def test_revoking_a_key_stops_it_serving_traffic(client):
     """A key the dashboard calls revoked must stop working, or the UI is lying."""
@@ -697,6 +807,10 @@ def test_revoking_a_key_stops_it_serving_traffic(client):
     assert client.post("/v1/chat/completions", content=body_for(), headers=auth).status_code == 401
     # Revoking twice is not success -- it would hide a bug in the caller.
     assert client.request("DELETE", "/admin/v1/keys/k_1", headers=ADMIN).status_code == 404
+    historical = client.get("/admin/v1/keys/k_1/usage", headers=ADMIN)
+    assert historical.status_code == 200
+    assert historical.json()["revoked_ms"] is not None
+    assert historical.json()["requests"] == 1
 
 
 def test_the_raw_key_is_never_stored(client, tmp_path):
@@ -719,6 +833,15 @@ def test_admin_routes_refuse_without_the_token(client):
         headers={"x-instant-admin-token": "wrong"},
     ).status_code == 401
     assert client.get("/admin/v1/keys", headers={"x-instant-admin-token": "wrong"}).status_code == 401
+    assert client.get("/admin/v1/keys/x/usage").status_code == 401
+    assert (
+        client.get(
+            "/admin/v1/keys/x/usage",
+            headers={"x-instant-admin-token": "wrong"},
+        ).status_code
+        == 401
+    )
+    assert client.get("/admin/v1/keys/x/usage", headers=ADMIN).status_code == 404
 
 
 def test_the_service_credential_still_works_alongside_minted_keys(client):
@@ -766,18 +889,18 @@ def test_dynamic_key_lookup_does_not_run_on_the_event_loop(
     loop_threads: set[int] = set()
     lookup_threads: set[int] = set()
     real_now = app_module._now_ms
-    real_lookup = client.app.state.ctx.state.key_is_active
+    real_lookup = client.app.state.ctx.state.active_key_id
 
     def spy_now() -> int:
         loop_threads.add(threading.get_ident())
         return real_now()
 
-    def spy_lookup(digest: str) -> bool:
+    def spy_lookup(digest: str) -> str | None:
         lookup_threads.add(threading.get_ident())
         return real_lookup(digest)
 
     monkeypatch.setattr(app_module, "_now_ms", spy_now)
-    monkeypatch.setattr(client.app.state.ctx.state, "key_is_active", spy_lookup)
+    monkeypatch.setattr(client.app.state.ctx.state, "active_key_id", spy_lookup)
     response = client.post(
         "/v1/chat/completions",
         content=body_for(),

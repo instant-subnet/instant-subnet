@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from instant.platform.state import UNFINISHED_GRACE_MS, KeyRevokedError, open_state
@@ -180,7 +182,7 @@ def test_a_v1_database_migrates_without_losing_telemetry(tmp_path):
 
     path = tmp_path / "v1.sqlite3"
     db = sqlite3.connect(path)
-    db.executescript(state_mod._SCHEMA.replace(state_mod._SCHEMA_KEYS, ""))
+    db.executescript(state_mod._SCHEMA_REQUESTS_V1)
     db.execute("PRAGMA user_version=1")
     db.execute(
         "INSERT INTO requests (request_id, miner_hotkey, started_ms, stream, success) "
@@ -224,7 +226,7 @@ def test_a_failed_migration_rolls_back_ddl_and_version(tmp_path, monkeypatch):
 
     path = tmp_path / "broken-v1.sqlite3"
     db = sqlite3.connect(path)
-    db.executescript(state_mod._SCHEMA.replace(state_mod._SCHEMA_KEYS, ""))
+    db.executescript(state_mod._SCHEMA_REQUESTS_V1)
     db.execute("PRAGMA user_version=1")
     db.commit()
     db.close()
@@ -270,5 +272,219 @@ def test_registering_a_revoked_digest_does_not_resurrect_it(tmp_path):
                 created_ms=3,
             )
         assert not state.key_is_active(digest), "a revoked key came back to life"
+    finally:
+        state.close()
+
+
+def test_a_v2_database_adds_nullable_key_attribution_without_backfill(tmp_path):
+    """Old telemetry cannot be safely guessed onto a newly registered key."""
+    import sqlite3
+
+    from instant.platform import state as state_mod
+
+    path = tmp_path / "v2.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript(state_mod._SCHEMA_REQUESTS_V1 + state_mod._SCHEMA_KEYS)
+    db.execute("PRAGMA user_version=2")
+    db.execute(
+        "INSERT INTO api_keys "
+        "(key_id, prefix, last4, digest, label, created_ms) "
+        "VALUES ('customer','isk_test','last','digest','ditto',1)"
+    )
+    db.execute(
+        "INSERT INTO requests (request_id, miner_hotkey, started_ms, stream, success) "
+        "VALUES ('historical','5Miner',1000,0,1)"
+    )
+    db.commit()
+    db.close()
+
+    migrated = open_state(path)
+    try:
+        row = migrated._db.execute(
+            "SELECT api_key_id FROM requests WHERE request_id='historical'"
+        ).fetchone()
+        assert row[0] is None
+        assert migrated.key_usage("customer")["requests"] == 0
+        assert (
+            migrated._db.execute("PRAGMA user_version").fetchone()[0]
+            == state_mod.SCHEMA_VERSION
+        )
+    finally:
+        migrated.close()
+
+
+def test_a_failed_v2_migration_rolls_back_column_index_and_version(
+    tmp_path, monkeypatch
+):
+    import sqlite3
+
+    from instant.platform import state as state_mod
+
+    path = tmp_path / "broken-v2.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript(state_mod._SCHEMA_REQUESTS_V1 + state_mod._SCHEMA_KEYS)
+    db.execute("PRAGMA user_version=2")
+    db.commit()
+    db.close()
+
+    monkeypatch.setitem(
+        state_mod._MIGRATIONS,
+        2,
+        "ALTER TABLE requests ADD COLUMN api_key_id TEXT; THIS IS NOT SQL;",
+    )
+    with pytest.raises(sqlite3.DatabaseError):
+        open_state(path)
+
+    check = sqlite3.connect(path)
+    try:
+        version = check.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            row[1] for row in check.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        index = check.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='index' AND name='requests_by_api_key'"
+        ).fetchone()
+    finally:
+        check.close()
+    assert version == 2
+    assert "api_key_id" not in columns
+    assert index is None
+
+
+def test_per_key_usage_is_exact_under_concurrency_and_ignores_unverified_tokens(
+    tmp_path, miner_key, platform_key
+):
+    state = open_state(tmp_path / "concurrent-key-usage.sqlite3")
+    try:
+        state.register_key(
+            key_id="key-a",
+            prefix="isk_alpha",
+            last4="aaaa",
+            digest="a" * 64,
+            label="alpha",
+            created_ms=1,
+        )
+        state.register_key(
+            key_id="key-b",
+            prefix="isk_bravo",
+            last4="bbbb",
+            digest="b" * 64,
+            label="bravo",
+            created_ms=2,
+        )
+
+        work = []
+        for index in range(40):
+            request_id = f"a-{index}"
+            success = index % 5 != 0
+            signed = (
+                receipts.build(
+                    miner_key,
+                    request_id=request_id,
+                    signer_of_request=platform_key.ss58_address,
+                    request_body=b"request",
+                    response_body=b"response",
+                    prompt_tokens=2,
+                    completion_tokens=3,
+                    ttft_ms_self=1,
+                    total_ms_self=2,
+                    started_at_ms=1_000 + index,
+                    finished_at_ms=1_010 + index,
+                )
+                if success
+                else None
+            )
+            work.append(
+                (request_id, "key-a", 1_000 + index, success, signed, 2, 3)
+            )
+        for index in range(30):
+            request_id = f"b-{index}"
+            signed = receipts.build(
+                miner_key,
+                request_id=request_id,
+                signer_of_request=platform_key.ss58_address,
+                request_body=b"request",
+                response_body=b"response",
+                prompt_tokens=1,
+                completion_tokens=1,
+                ttft_ms_self=1,
+                total_ms_self=2,
+                started_at_ms=2_000 + index,
+                finished_at_ms=2_010 + index,
+            )
+            work.append((request_id, "key-b", 2_000 + index, True, signed, 1, 1))
+
+        def write(record):
+            request_id, key_id, started_ms, success, signed, prompt, completion = record
+            state.begin(
+                request_id=request_id,
+                miner_hotkey=miner_key.ss58_address,
+                started_ms=started_ms,
+                stream=True,
+                api_key_id=key_id,
+            )
+            state.finish(
+                request_id=request_id,
+                finished_ms=started_ms + 10,
+                status_code=200 if success else 502,
+                success=success,
+                prompt_tokens=prompt if success else 100_000,
+                completion_tokens=completion if success else 100_000,
+                signed_receipt=signed,
+                receipt_seen=success,
+                receipt_verified=success,
+                error=None if success else "invalid receipt",
+            )
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(write, work))
+
+        # A service-credential request remains deliberately unattributed.
+        state.begin(
+            request_id="service",
+            miner_hotkey=miner_key.ss58_address,
+            started_ms=9_999,
+            stream=False,
+            api_key_id=None,
+        )
+        state.finish(
+            request_id="service",
+            finished_ms=10_000,
+            status_code=500,
+            success=False,
+            prompt_tokens=100_000,
+            completion_tokens=100_000,
+        )
+
+        listed = {row["key_id"]: row for row in state.list_keys()}
+        assert listed["key-a"] == {
+            "key_id": "key-a",
+            "prefix": "isk_alpha",
+            "last4": "aaaa",
+            "label": "alpha",
+            "created_ms": 1,
+            "revoked_ms": None,
+            "last_used_ms": 1_039,
+            "requests": 40,
+            "successful_requests": 32,
+            "verified_requests": 32,
+            "prompt_tokens": 64,
+            "completion_tokens": 96,
+            "total_tokens": 160,
+        }
+        assert listed["key-b"]["last_used_ms"] == 2_029
+        assert listed["key-b"]["requests"] == 30
+        assert listed["key-b"]["prompt_tokens"] == 30
+        assert listed["key-b"]["completion_tokens"] == 30
+        assert listed["key-b"]["total_tokens"] == 60
+
+        assert state.revoke_key(key_id="key-a", revoked_ms=3_000)
+        retained = state.key_usage("key-a")
+        assert retained is not None
+        assert retained["revoked_ms"] == 3_000
+        assert retained["last_used_ms"] == 1_039
+        assert retained["total_tokens"] == 160
+        assert state.key_usage("missing") is None
     finally:
         state.close()
