@@ -14,7 +14,7 @@ operator must select ``--set-weights-once`` *and* set the localnet-only
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +26,56 @@ from .state import ValidatorState
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+#: How far a read-back weight may differ from the expected normalised value.
+#: One unit absorbs the chain's own rounding choice without admitting a
+#: materially different vector: 65535 units is 100%, so one unit is 0.0015%.
+READBACK_TOLERANCE_U16 = 1
+
+
+def normalise_u16(weights: Mapping[int, int]) -> dict[int, int]:
+    """Scale a vector so its largest weight is ``MAX_WEIGHT_U16``.
+
+    ``set_mechanism_weights`` renormalises on the way in: the chain keeps the
+    *ratios* and rescales so the maximum becomes u16::MAX.  A vector submitted
+    as ``{1: 31173, 3: 34362}`` reads back as ``{1: 59453, 3: 65535}`` — the
+    same proportions, different absolute numbers.
+
+    With one miner this is the identity (65535 stays 65535), which is why
+    comparing raw submitted values appeared to work right up until a second
+    miner existed and every write started reporting a false mismatch.
+
+    Rounds half up rather than truncating, which matches the value the runtime
+    produced when this was checked against the live chain.
+    """
+    peak = max(weights.values(), default=0)
+    if peak <= 0:
+        return dict(weights)
+    return {
+        uid: (value * MAX_WEIGHT_U16 * 2 + peak) // (peak * 2)
+        for uid, value in weights.items()
+    }
+
+
+def readback_matches(expected: Mapping[int, int], actual: Mapping[int, int]) -> bool:
+    """True if ``actual`` is ``expected`` as the chain would have stored it.
+
+    Compares the normalised forms, so this asks the question that matters — did
+    the chain record the proportions we chose — rather than whether it echoed
+    our arbitrary scale back verbatim.
+    """
+    wanted = normalise_u16(expected)
+    # ``_readback`` keeps only positive weights, so a uid whose share is small
+    # enough to normalise to zero is simply absent from the chain's map. Compare
+    # on the same footing rather than calling that a mismatch.
+    significant = {uid: value for uid, value in wanted.items() if value > 0}
+    if set(significant) != set(actual):
+        return False
+    return all(
+        abs(actual[uid] - value) <= READBACK_TOLERANCE_U16
+        for uid, value in significant.items()
+    )
 
 
 def _plain(value: Any) -> Any:
@@ -205,8 +255,8 @@ class WeightWriter:
         # match as a completed write would never refresh LastUpdate and would
         # eventually make the validator inactive.
         recently_updated = 0 <= block - last_update <= self.period_blocks
-        if recently_updated and self._readback(own_uid) == dict(
-            zip(uids, weights, strict=True)
+        if recently_updated and readback_matches(
+            dict(zip(uids, weights, strict=True)), self._readback(own_uid)
         ):
             result = WeightSubmission(
                 epoch=epoch,
@@ -271,10 +321,11 @@ class WeightWriter:
             try:
                 expected = dict(zip(uids, weights, strict=True))
                 actual = self._readback(own_uid)
-                if actual != expected:
+                if not readback_matches(expected, actual):
                     ok = False
                     message = (
-                        f"finalized but readback differs: expected {expected}, "
+                        "finalized but readback differs: expected "
+                        f"{normalise_u16(expected)} (normalised from {expected}), "
                         f"got {actual}"
                     )
                 else:
