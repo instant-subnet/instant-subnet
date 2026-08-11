@@ -597,7 +597,7 @@ def _commit_result(state: ValidatorState, *, epoch: int, hotkeys, attested: bool
     rows = []
     for uid, hotkey in enumerate(hotkeys):
         for source in ("shadow", "direct"):
-            for _ in range(config.min_probes):
+            for _ in range(config.min_probe_successes):
                 rows.append(probe(epoch, hotkey, uid=uid, source=source))
         if attested:
             state.record_attestation(epoch=epoch, hotkey=hotkey, ok=True, verified_ms=0)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -248,8 +249,6 @@ async def test_score_once_runs_twenty_real_receipt_verified_direct_probes(
         validator_signer=validator_key,
         http=platform_http,
     )
-    response_body = b'{"choices":[{"message":{"content":"pong"}}]}'
-
     async def miner_handler(request: httpx.Request) -> httpx.Response:
         request_body = await request.aread()
         verified = verify_headers(
@@ -258,12 +257,24 @@ async def test_score_once_runs_twenty_real_receipt_verified_direct_probes(
             allowed_signers=[validator_key.ss58_address],
             expected_signed_for=miner_key.ss58_address,
         )
+        # Each probe carries its own nonce-prefixed challenge and the probe
+        # streams, so a working miner has to answer over SSE and sign the
+        # concatenated data payloads it actually sent.
+        prompt = json.loads(request_body)["messages"][0]["content"]
+        first, last = re.search(r"from (\d+) to (\d+)", prompt).groups()
+        answer = " ".join(str(v) for v in range(int(first), int(last) + 1))
+        frames = [
+            json.dumps(
+                {"choices": [{"delta": {"content": piece}}]}, separators=(",", ":")
+            ).encode()
+            for piece in re.findall(r"\s*\S+", answer)
+        ]
         signed = receipts.build(
             miner_key,
             request_id=verified.uuid,
             signer_of_request=verified.signed_by,
             request_body=request_body,
-            response_body=response_body,
+            response_body=b"".join(frames),
             prompt_tokens=5,
             completion_tokens=4,
             ttft_ms_self=1,
@@ -271,15 +282,17 @@ async def test_score_once_runs_twenty_real_receipt_verified_direct_probes(
             started_at_ms=now_ms,
             finished_at_ms=now_ms + 2,
         )
+        wire = b"".join(b"data: " + frame + b"\n\n" for frame in frames)
+        wire += b"data: [DONE]\n\n"
+        wire += (
+            b"event: "
+            + receipts.SSE_RECEIPT_EVENT.encode()
+            + b"\ndata: "
+            + json.dumps(signed.to_payload(), separators=(",", ":")).encode()
+            + b"\n\n"
+        )
         return httpx.Response(
-            200,
-            content=response_body,
-            headers={
-                receipts.H_RECEIPT: json.dumps(
-                    signed.receipt.to_payload(), separators=(",", ":"), sort_keys=True
-                ),
-                receipts.H_RECEIPT_SIG: signed.signature,
-            },
+            200, content=wire, headers={"Content-Type": "text/event-stream"}
         )
 
     probe_http = httpx.AsyncClient(transport=httpx.MockTransport(miner_handler))
@@ -311,7 +324,7 @@ async def test_score_once_runs_twenty_real_receipt_verified_direct_probes(
 
     run, _ = await coordinator.run_once(snapshot)
 
-    assert run.direct_probe_attempts == config.min_probes == 20
+    assert run.direct_probe_attempts == config.probe.direct_count == 20
     assert run.direct_probe_successes == 20
     assert run.empty is False
     assert run.total_weight == 65_535
