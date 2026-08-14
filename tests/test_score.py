@@ -894,3 +894,21 @@ def test_a_probe_budget_too_small_for_an_answer_is_refused():
 def test_the_shipped_probe_budget_can_hold_an_answer():
     config = load_scoring_config()
     assert config.probe.max_tokens >= 160
+
+
+def test_scoring_does_not_apply_the_burn(config):
+    # The burn belongs to weights.py. If it ever leaks into scoring it would
+    # enter carry_forward and compound through the EMA, ratcheting every
+    # restart further toward a full burn -- the failure resi guards against by
+    # skipping the burn uid during consensus bootstrap.
+    observation = MinerObservations(
+        uid=1,
+        hotkey="5MinerHotkey",
+        direct=SourceSample(
+            attempts=20, successes=20, ttft_ms=(100,) * 20, tps_milli=(120_000,) * 20
+        ),
+        attested=False,
+    )
+    result = score_epoch([observation], config, attestation_mode="off")
+    assert sum(result.weights.values()) == MAX_WEIGHT_U16
+    assert result.weights == {1: MAX_WEIGHT_U16}

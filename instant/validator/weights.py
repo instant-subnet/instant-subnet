@@ -13,15 +13,34 @@ operator must select ``--set-weights-once`` *and* set the localnet-only
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from instant.protocol.canonical import digest
-from instant.validator.score import MAX_WEIGHT_U16
+from instant.validator.score import BPS_ONE, MAX_WEIGHT_U16, cube_normalise
 
 from .state import ValidatorState
+
+log = logging.getLogger("instant.validator")
+
+#: The burn dial, in basis points. 10000 is 100%: the entire emission goes to
+#: the subnet owner and miners are paid nothing.
+#:
+#: This is a constant rather than configuration, and deliberately so. Changing
+#: what miners are paid is a code change, a review and a deploy — not an env
+#: var somebody can set differently on one host. Every validator must apply
+#: the same rate in the same epoch or they submit different vectors from
+#: identical observations and burn each other's vtrust; a constant in the
+#: released artifact is the only form of that number which cannot silently
+#: differ per operator.
+#:
+#: 100% is also the one setting where that risk is nil, because the vector is
+#: ``{owner: 65535}`` regardless of what any miner scored. That makes it the
+#: right place to launch from and dial down out of, rather than up into.
+MANUAL_BURN_BPS = 10_000
 
 
 def _now_ms() -> int:
@@ -131,6 +150,7 @@ class WeightWriter:
         version_key: int = 0,
         period_blocks: int = 8,
         config_version: int = 1,
+        burn_rate_bps: int = MANUAL_BURN_BPS,
     ) -> None:
         self.subtensor = subtensor
         self.wallet = wallet
@@ -143,6 +163,128 @@ class WeightWriter:
         self.version_key = version_key
         self.period_blocks = period_blocks
         self.config_version = config_version
+        self.burn_rate_bps = burn_rate_bps
+
+    def _burn_target(self, hotkeys: list[str], own_uid: int) -> tuple[int, str]:
+        """Locate the subnet owner in the metagraph, or refuse.
+
+        The recipient is read from the chain rather than configured. A pinned
+        uid is a hostage to uid recycling -- if the owner vacates that slot, a
+        pinned uid pays whoever registers into it next and every log line still
+        reads correctly. ``SubnetOwnerHotkey`` is the chain's own answer to
+        "who owns this subnet", and it is the same answer for every validator.
+
+        Every failure here raises. Returning the vector unburned instead would
+        pay miners the entire emission -- with a 50% rate that is double what
+        was intended, produced by a transient RPC hiccup. Refusing leaves the
+        previous vector standing on chain, which is the smaller error.
+        """
+        try:
+            owner = _plain(
+                self.subtensor.query_subtensor(
+                    "SubnetOwnerHotkey", params=[self.netuid]
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - boundary is the chain
+            raise WeightSafetyError(
+                f"cannot read SubnetOwnerHotkey for netuid {self.netuid}: {exc}. "
+                "Refusing to submit rather than paying miners the burn share"
+            ) from exc
+
+        owner = str(owner) if owner else ""
+        if not owner:
+            raise WeightSafetyError(
+                f"chain reports no owner hotkey for netuid {self.netuid}; "
+                "refusing to submit a vector with nowhere to burn to"
+            )
+        if owner not in hotkeys:
+            raise WeightSafetyError(
+                f"subnet owner hotkey {owner} is not registered on netuid "
+                f"{self.netuid}; there is no uid to assign the burn share to"
+            )
+        burn_uid = hotkeys.index(owner)
+        if burn_uid == own_uid:
+            raise WeightSafetyError(
+                f"subnet owner uid {burn_uid} is this validator; assigning the "
+                "burn share to ourselves is self-dealing, not burning"
+            )
+        return burn_uid, owner
+
+    def _apply_burn(
+        self,
+        scored: list[tuple[int, str, int]],
+        *,
+        hotkeys: list[str],
+        own_uid: int,
+        epoch: int,
+    ) -> list[tuple[int, str, int]]:
+        """Reserve the burn share for the owner, apportion the rest to miners.
+
+        At the shipped :data:`MANUAL_BURN_BPS` of 10000 the miner half is empty
+        and this collapses to ``{owner: 65535}``. The apportionment below is
+        what makes dialling the constant down a one-line change rather than a
+        second implementation.
+
+        Integer arithmetic throughout, and the remainder is handed out by the
+        same largest-remainder rule the scoring path uses, so two validators
+        with identical scores and the same released constant produce
+        byte-identical vectors rather than nearly-identical ones.
+        """
+        if self.burn_rate_bps <= 0:
+            return list(scored)
+
+        burn_uid, burn_hotkey = self._burn_target(hotkeys, own_uid)
+
+        # Nobody earned anything, so the whole emission burns. Submitting the
+        # all-zero vector instead is either rejected or read as an abstention
+        # depending on the SDK version, and neither is what we mean.
+        if not scored:
+            log.warning(
+                "epoch %s scored no miners; burning the full emission to uid %s",
+                epoch,
+                burn_uid,
+            )
+            return [(burn_uid, burn_hotkey, MAX_WEIGHT_U16)]
+
+        # rate_bps >= 1 puts this at 6 or more, so the burn share is never
+        # empty once the dial is off zero.
+        burn_u16 = MAX_WEIGHT_U16 * self.burn_rate_bps // BPS_ONE
+        miner_total = MAX_WEIGHT_U16 - burn_u16
+
+        # exponent=1 makes this a plain proportional apportionment. Reusing
+        # cube_normalise rather than repeating its remainder handling means
+        # there is exactly one implementation of "share integers exactly".
+        shares = cube_normalise(
+            {uid: weight for uid, _, weight in scored}, exponent=1, total=miner_total
+        )
+        hotkey_of = {uid: hotkey for uid, hotkey, _ in scored}
+        hotkey_of.setdefault(burn_uid, burn_hotkey)
+
+        # A share can round to zero at a high burn rate -- 9999 bps leaves 7
+        # units for the whole field -- and a zero weight is not something to
+        # submit, so those uids drop out. Dropping them cannot change the total,
+        # because they contribute nothing to it.
+        totals = {uid: share for uid, share in shares.items() if share > 0}
+
+        # The owner may itself be a scored miner, in which case it earns its
+        # miner share *and* the burn. Appending a second entry for the same uid
+        # would produce a vector the chain will not accept, and would fail as a
+        # confusing "duplicate UIDs" rather than as the thing that happened.
+        totals[burn_uid] = totals.get(burn_uid, 0) + burn_u16
+
+        vector = [(uid, hotkey_of[uid], totals[uid]) for uid in sorted(totals)]
+
+        log.info(
+            "epoch %s burning %s bps (%s of %s) to owner uid %s; %s miners share %s",
+            epoch,
+            self.burn_rate_bps,
+            burn_u16,
+            MAX_WEIGHT_U16,
+            burn_uid,
+            len(shares),
+            miner_total,
+        )
+        return vector
 
     def submit_latest_once(self) -> WeightSubmission:
         """Submit the latest persisted score vector, never more than once."""
@@ -166,7 +308,7 @@ class WeightWriter:
             )
 
         scores = self.state.scores_for_epoch(epoch)
-        vector = sorted(
+        scored = sorted(
             (
                 (int(row["uid"]), str(row["hotkey"]), int(row["weight_u16"]))
                 for row in scores
@@ -174,24 +316,15 @@ class WeightWriter:
             ),
             key=lambda item: item[0],
         )
-        if not vector:
-            raise WeightSafetyError(
-                f"epoch {epoch} has an all-zero vector; refusing to submit"
-            )
-        if sum(weight for _, _, weight in vector) != MAX_WEIGHT_U16:
+        if scored and sum(weight for _, _, weight in scored) != MAX_WEIGHT_U16:
             raise WeightSafetyError(
                 "score vector does not sum to the canonical u16 total 65535"
             )
-        uids = tuple(uid for uid, _, _ in vector)
-        weights = tuple(weight for _, _, weight in vector)
-        if len(set(uids)) != len(uids):
-            raise WeightSafetyError("score vector contains duplicate UIDs")
-        vector_digest = digest(
-            {"netuid": self.netuid, "mecid": self.mechanism_id,
-             "uids": list(uids), "weights": list(weights),
-             "version_key": self.version_key}
-        )
 
+        # The metagraph is read before the vector is final, because the burn
+        # share is assigned to a uid resolved from it. Everything downstream --
+        # the digest, the chain-limit gates, the readback expectation -- has to
+        # see the vector we actually submit, not the one before burn.
         graph = self.subtensor.metagraph(self.netuid, lite=True)
         hotkeys = [str(value) for value in graph.hotkeys]
         own_hotkey = self.wallet.hotkey.ss58_address
@@ -204,13 +337,35 @@ class WeightWriter:
         stake = self._stake_for(graph, own_uid)
         if stake <= 0:
             raise WeightSafetyError("validator has no stake on this subnet")
-        if own_uid in uids:
-            raise WeightSafetyError("score vector assigns weight to the validator itself")
-        for uid, expected_hotkey, _ in vector:
+        for uid, expected_hotkey, _ in scored:
             if uid >= len(hotkeys) or hotkeys[uid] != expected_hotkey:
                 raise WeightSafetyError(
                     f"uid/hotkey mapping changed since scoring for uid {uid}"
                 )
+
+        vector = self._apply_burn(
+            scored, hotkeys=hotkeys, own_uid=own_uid, epoch=epoch
+        )
+        if not vector:
+            raise WeightSafetyError(
+                f"epoch {epoch} has an all-zero vector and no burn is "
+                "configured; refusing to submit"
+            )
+        if sum(weight for _, _, weight in vector) != MAX_WEIGHT_U16:
+            raise WeightSafetyError(
+                "weight vector does not sum to the canonical u16 total 65535"
+            )
+        uids = tuple(uid for uid, _, _ in vector)
+        weights = tuple(weight for _, _, weight in vector)
+        if len(set(uids)) != len(uids):
+            raise WeightSafetyError("weight vector contains duplicate UIDs")
+        if own_uid in uids:
+            raise WeightSafetyError("weight vector assigns weight to the validator itself")
+        vector_digest = digest(
+            {"netuid": self.netuid, "mecid": self.mechanism_id,
+             "uids": list(uids), "weights": list(weights),
+             "version_key": self.version_key}
+        )
 
         block = int(self.subtensor.get_current_block())
         spec_version = self._runtime_spec_version()
