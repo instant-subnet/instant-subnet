@@ -23,7 +23,7 @@ from instant.validator.score import (
 )
 
 from .probe import (
-    DEFAULT_MAX_COMPLETION_TOKENS,
+    MAX_COMPLETION_TOKENS,
     MAX_CONCURRENCY,
     MAX_PROBE_COUNT,
     ProbeTarget,
@@ -192,10 +192,10 @@ class ScoringCoordinator:
         )
         if not configured:
             return
-        if self.config.min_probes > MAX_PROBE_COUNT:
+        if self.config.probe.direct_count > MAX_PROBE_COUNT:
             raise ScoreRunError(
-                f"scoring requires {self.config.min_probes} probes per miner, but "
-                f"the bounded prober permits at most {MAX_PROBE_COUNT}"
+                f"scoring requires {self.config.probe.direct_count} probes per "
+                f"miner, but the bounded prober permits at most {MAX_PROBE_COUNT}"
             )
 
         results = []
@@ -213,12 +213,17 @@ class ScoringCoordinator:
                 targets=(target,),
                 epoch=epoch,
                 model=self.probe_model,  # type: ignore[arg-type]
-                count=self.config.min_probes,
+                count=self.config.probe.direct_count,
                 concurrency=min(
                     self.config.probe.max_concurrent_probes, MAX_CONCURRENCY
                 ),
+                # Clamped to the module's hard ceiling, not to its default. It
+                # used to be min(max_tokens, DEFAULT), and since the default was
+                # 8 the configured 256 never applied: gpt-oss spent all eight
+                # tokens on reasoning and every probe scored a truncated
+                # preamble with content: null as a success.
                 max_completion_tokens=min(
-                    self.config.probe.max_tokens, DEFAULT_MAX_COMPLETION_TOKENS
+                    self.config.probe.max_tokens, MAX_COMPLETION_TOKENS
                 ),
                 timeout_s=float(self.config.probe.timeout_s),
             )

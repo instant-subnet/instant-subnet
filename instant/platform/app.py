@@ -10,14 +10,13 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from ..protocol import receipts
+from ..protocol import receipts, sse
 from ..protocol.epistula import (
     EpistulaError,
     ReplayGuard,
@@ -354,7 +353,7 @@ def create_app(ctx: PlatformContext) -> FastAPI:
                     receipt = evidence.signed_receipt if evidence.verified else None
                     ttft_ms = observer.ttft_ms(total_ms) if success else None
                     tps_milli = (
-                        _observed_tps_milli(
+                        sse.observed_tps_milli(
                             receipt.receipt.completion_tokens,
                             total_ms=total_ms,
                             ttft_ms=ttft_ms or 0,
@@ -625,90 +624,14 @@ def _verify_header_receipt(
         return _ReceiptEvidence(seen=True, error=f"invalid miner receipt: {exc}")
 
 
-class _StreamObserver:
-    def __init__(self, *, started_perf: float) -> None:
-        self.started_perf = started_perf
-        self.first_content_perf: float | None = None
-        self.assembled = bytearray()
-        self.buffer = bytearray()
-        self.receipt_payload: dict[str, Any] | None = None
-        self.receipt_seen = False
-        self.error_event = False
-        self.protocol_error: str | None = None
+class _StreamObserver(sse.StreamCommitment):
+    """The platform's view of a streamed miner response.
 
-    def feed(self, chunk: bytes) -> list[bytes]:
-        forwarded: list[bytes] = []
-        self.buffer.extend(chunk)
-        while True:
-            boundary = _frame_boundary(self.buffer)
-            if boundary is None:
-                return forwarded
-            index, width = boundary
-            frame = bytes(self.buffer[:index])
-            del self.buffer[: index + width]
-            if self._frame(frame):
-                # Normalise the separator only; the frame bytes are otherwise
-                # relayed exactly. The receipt and upstream [DONE] stay inside
-                # the trusted platform/miner hop.
-                forwarded.append(frame + b"\n\n")
-
-    def _frame(self, raw: bytes) -> bool:
-        lines = raw.replace(b"\r\n", b"\n").split(b"\n")
-        event = next(
-            (line[6:].strip().decode() for line in lines if line.startswith(b"event:")),
-            None,
-        )
-        data_lines = [line[5:].strip() for line in lines if line.startswith(b"data:")]
-        if event == receipts.SSE_RECEIPT_EVENT:
-            self.receipt_seen = True
-            if not data_lines:
-                self.protocol_error = "miner emitted a receipt event without data"
-                return False
-            try:
-                payload = json.loads(b"\n".join(data_lines))
-                self.receipt_payload = payload if isinstance(payload, dict) else None
-            except ValueError:
-                self.receipt_payload = None
-            return False
-        if event == "error":
-            self.error_event = True
-            return False
-        if event is not None:
-            # Only ordinary OpenAI data frames are part of the receipt's
-            # response commitment. Forwarding an arbitrary named event would
-            # let a miner show bytes to the customer that it never signed.
-            self.protocol_error = f"miner emitted unsupported SSE event {event!r}"
-            return False
-        if self.protocol_error is not None or self.error_event:
-            return False
-        if not data_lines:
-            # SSE comment heartbeats are transport metadata, not model output,
-            # and keep long reasoning requests alive through intermediaries.
-            nonblank = [line.strip() for line in lines if line.strip()]
-            return bool(nonblank) and all(line.startswith(b":") for line in nonblank)
-        data = b"\n".join(data_lines)
-        if data == b"[DONE]":
-            return False
-        try:
-            payload = json.loads(data)
-        except ValueError:
-            self.protocol_error = "miner emitted a non-JSON SSE data frame"
-            return False
-        if not isinstance(payload, dict):
-            self.protocol_error = "miner emitted a non-object SSE data frame"
-            return False
-        if payload.get("error") is not None:
-            self.error_event = True
-            return False
-        self.assembled.extend(data)
-        if self.first_content_perf is None and _has_content(data):
-            self.first_content_perf = time.perf_counter()
-        return True
-
-    def ttft_ms(self, total_ms: int) -> int:
-        if self.first_content_perf is None:
-            return total_ms
-        return max(0, int((self.first_content_perf - self.started_perf) * 1000))
+    Frame parsing and the assembled-bytes commitment live in
+    :mod:`instant.protocol.sse` so that this observer and the validator's direct
+    prober cannot drift on which bytes a receipt covers. Only the platform's
+    verification policy is here.
+    """
 
     def verify(
         self,
@@ -854,31 +777,6 @@ def _bearer_error() -> JSONResponse:
         status_code=401,
         headers={"WWW-Authenticate": "Bearer"},
     )
-
-
-def _frame_boundary(buffer: bytearray) -> tuple[int, int] | None:
-    lf = buffer.find(b"\n\n")
-    crlf = buffer.find(b"\r\n\r\n")
-    choices = [(lf, 2), (crlf, 4)]
-    valid = [choice for choice in choices if choice[0] >= 0]
-    return min(valid, default=None, key=lambda choice: choice[0])
-
-
-def _has_content(raw: bytes) -> bool:
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        return False
-    for choice in payload.get("choices") or []:
-        delta = choice.get("delta") or {}
-        if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
-            return True
-    return False
-
-
-def _observed_tps_milli(tokens: int, *, total_ms: int, ttft_ms: int) -> int:
-    generation_ms = max(1, total_ms - ttft_ms)
-    return max(0, int(tokens)) * 1_000_000 // generation_ms
 
 
 def _now_ms() -> int:

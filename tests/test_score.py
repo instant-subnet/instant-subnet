@@ -752,7 +752,7 @@ def scoring_table() -> dict:
                 "pass_bps": 10000,
                 "warn_bps": 1500,
                 "fail_bps": 0,
-                "min_probes": 20,
+                "min_probe_successes": 12,
                 "gate_out_after_misses": 2,
                 "gate_out_cooldown_epochs": 1,
             },
@@ -764,6 +764,7 @@ def scoring_table() -> dict:
                 "max_concurrent_probes": 16,
                 "max_tokens": 256,
                 "prompt_nonce_bytes": 16,
+                "direct_count": 20,
             },
             "penalty": {"receipt_mismatch": 0, "capacity_overclaim": 8000},
         }
@@ -817,11 +818,35 @@ def test_an_exponent_below_one_is_refused():
         load_scoring_config(slo_table(), table)
 
 
-def test_a_zero_min_probes_is_refused():
+def test_a_zero_min_probe_successes_is_refused():
     table = scoring_table()
-    table["gate"]["min_probes"] = 0
+    table["gate"]["min_probe_successes"] = 0
     with pytest.raises(ConfigError, match="at least 1"):
         load_scoring_config(slo_table(), table)
+
+
+def test_a_success_floor_equal_to_the_attempt_count_is_refused():
+    # The bug this guard exists for: 20 attempts and a floor of 20 successes
+    # means one transient miss zeroes a healthy miner for the epoch.
+    table = scoring_table()
+    table["gate"]["min_probe_successes"] = table["probe"]["direct_count"]
+    with pytest.raises(ConfigError, match="must be strictly below"):
+        load_scoring_config(slo_table(), table)
+
+
+def test_a_success_floor_above_the_attempt_count_is_refused():
+    table = scoring_table()
+    table["gate"]["min_probe_successes"] = table["probe"]["direct_count"] + 1
+    with pytest.raises(ConfigError, match="must be strictly below"):
+        load_scoring_config(slo_table(), table)
+
+
+def test_the_shipped_config_leaves_the_gate_real_headroom():
+    # Guards the actual config file, not a fixture: a shipped config whose
+    # floor crept back up to the attempt count would reintroduce the bug.
+    config = load_scoring_config()
+    assert config.min_probe_successes < config.probe.direct_count
+    assert config.probe.direct_count - config.min_probe_successes >= 4
 
 
 def test_a_zero_latency_target_is_refused():
@@ -854,3 +879,18 @@ def test_config_objects_are_frozen(config):
 def test_components_serialise_flat_for_the_scores_endpoint():
     keys = Components(1, 2, 3, 4, 5).as_dict().keys()
     assert all(k.endswith("_bps") for k in keys)
+
+
+def test_a_probe_budget_too_small_for_an_answer_is_refused():
+    # An undersized budget fails silently in the worst way: the answer is
+    # truncated, every probe fails its content check, and a healthy miner is
+    # gated out with nothing but "content mismatch" to show for it.
+    table = scoring_table()
+    table["probe"]["max_tokens"] = 8
+    with pytest.raises(ConfigError, match="below 160"):
+        load_scoring_config(slo_table(), table)
+
+
+def test_the_shipped_probe_budget_can_hold_an_answer():
+    config = load_scoring_config()
+    assert config.probe.max_tokens >= 160

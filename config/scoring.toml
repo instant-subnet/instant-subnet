@@ -13,7 +13,7 @@
 # weight vectors rather than nearly-identical ones.
 
 [version]
-id = 2
+id = 3
 
 [weights]
 # The §8.1 formula:
@@ -62,10 +62,27 @@ pass_bps = 10000
 warn_bps = 1500
 fail_bps = 0
 
-# Minimum successful probes in an epoch before a miner is scored at all.
+# Minimum *successful* probes in an epoch before a miner is scored at all.
 # Without it a miner that answered one probe perfectly outscores a miner
 # that answered four hundred.
-min_probes = 20
+#
+# This is a sample-size floor, and it must stay strictly below
+# [probe].direct_count -- the attempts actually sent. The two used to be the
+# same number (20 and 20), which left no headroom whatsoever: one timeout, or
+# one honest 429 while the miner was busy serving customers, dropped it below
+# the floor and zeroed it for the epoch. Twice in a row and
+# gate_out_after_misses dropped it from rotation entirely. That charged the
+# same misses twice, because reliability_bps already prices them
+# continuously -- and it punished exactly the backpressure reliability_bps
+# deliberately gives half credit to.
+#
+# 12 of 20 leaves eight misses of headroom. Deliberately generous for now
+# because probes newly assert the *content* of the answer, and the real
+# mismatch rate against a live miner under load has not been measured yet.
+# Tighten once it has. Note percentile() is self-correcting here: at fewer
+# than 20 samples nearest-rank p95 collapses to the maximum observation, so
+# a miner with fewer successes already gets its worst latency scored.
+min_probe_successes = 12
 
 # Consecutive epochs of gate failure before a miner is dropped from
 # rotation, and how long it stays out once dropped. Flapping in and out to
@@ -102,9 +119,18 @@ timeout_s             = 30
 max_concurrent_probes = 1
 max_tokens            = 256
 
+# Direct probe attempts per miner per epoch. Strictly greater than
+# [gate].min_probe_successes; load_scoring_config refuses a config where it is
+# not, because equality is what made a single miss fatal.
+direct_count = 20
+
 # Every probe prompt is prefixed with a random 16-byte nonce so no two
 # probes share a prompt-cache key. Without this a miner caches the probe and
 # reports a TTFT that measures its cache, not its hardware.
+#
+# The nonce is a *prefix* on purpose: a paged KV cache keys on the shared
+# leading tokens, so a trailing nonce would still serve most of the prompt
+# from cache.
 prompt_nonce_bytes = 16
 
 [penalty]

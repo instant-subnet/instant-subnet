@@ -52,6 +52,20 @@ SOURCES: tuple[str, ...] = ("shadow", "direct", "telemetry")
 
 AttestationMode = Literal["hard", "warn", "off"]
 
+#: Smallest ``[probe].max_tokens`` that can hold a probe answer.
+#:
+#: Duplicated as a number rather than imported from ``validator.probe`` because
+#: ``probe`` imports ``state`` which imports this module; the constant is small
+#: and the cycle is not worth it.
+#:
+#: Measured against the launch H200: the largest challenge this prober emits (40
+#: integers) costs 97 completion tokens including its reasoning preamble, at
+#: either two or three digits. 160 is that with comfortable headroom. The floor
+#: matters because an undersized budget does not degrade gracefully — the answer
+#: is truncated, every probe fails its content check, and a healthy miner is
+#: gated out with nothing in the logs but "content mismatch".
+MIN_PROBE_MAX_TOKENS = 160
+
 
 # --- configuration ----------------------------------------------------------
 
@@ -104,6 +118,12 @@ class ProbeConfig:
     max_concurrent_probes: int
     max_tokens: int
     prompt_nonce_bytes: int
+    #: Direct probe *attempts* per miner per epoch. Distinct from
+    #: ``gate.min_probe_successes``, which is how many of them must succeed.
+    #: These were once the same number, which meant a single transient miss —
+    #: one timeout, one honest 429 while the miner was full — zeroed a healthy
+    #: miner for the epoch, and two in a row tripped it into a cooldown.
+    direct_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +151,7 @@ class ScoringConfig:
     gate_pass_bps: int
     gate_warn_bps: int
     gate_fail_bps: int
-    min_probes: int
+    min_probe_successes: int
     gate_out_after_misses: int
     gate_out_cooldown_epochs: int
 
@@ -217,7 +237,9 @@ def load_scoring_config(
         gate_pass_bps=_require(raw, "gate", "pass_bps", "scoring.toml"),
         gate_warn_bps=_require(raw, "gate", "warn_bps", "scoring.toml"),
         gate_fail_bps=_require(raw, "gate", "fail_bps", "scoring.toml"),
-        min_probes=_require(raw, "gate", "min_probes", "scoring.toml"),
+        min_probe_successes=_require(
+            raw, "gate", "min_probe_successes", "scoring.toml"
+        ),
         gate_out_after_misses=_require(raw, "gate", "gate_out_after_misses", "scoring.toml"),
         gate_out_cooldown_epochs=_require(
             raw, "gate", "gate_out_cooldown_epochs", "scoring.toml"
@@ -233,6 +255,7 @@ def load_scoring_config(
             ),
             max_tokens=_require(raw, "probe", "max_tokens", "scoring.toml"),
             prompt_nonce_bytes=_require(raw, "probe", "prompt_nonce_bytes", "scoring.toml"),
+            direct_count=_require(raw, "probe", "direct_count", "scoring.toml"),
         ),
         penalty_receipt_mismatch=_require(
             raw, "penalty", "receipt_mismatch", "scoring.toml"
@@ -262,10 +285,36 @@ def load_scoring_config(
             f"scoring.toml [normalisation].exponent = {config.exponent} must be "
             "at least 1; below that the fastest miner earns least."
         )
-    if config.min_probes < 1:
+    if config.min_probe_successes < 1:
         raise ConfigError(
-            "scoring.toml [gate].min_probes must be at least 1, or a miner "
-            "that answered nothing is scored on nothing."
+            "scoring.toml [gate].min_probe_successes must be at least 1, or a "
+            "miner that answered nothing is scored on nothing."
+        )
+    if config.probe.direct_count < 1:
+        raise ConfigError(
+            "scoring.toml [probe].direct_count must be at least 1; it is how "
+            "many probes the prober actually sends."
+        )
+    if config.probe.max_tokens < MIN_PROBE_MAX_TOKENS:
+        raise ConfigError(
+            f"scoring.toml [probe].max_tokens = {config.probe.max_tokens} is "
+            f"below {MIN_PROBE_MAX_TOKENS}. A probe answer costs about 97 "
+            "completion tokens including gpt-oss's reasoning preamble, and a "
+            "budget too small to hold it does not fail loudly: the answer is "
+            "truncated, every probe fails its content check, and a healthy "
+            "miner is gated out for what looks like serving wrong output."
+        )
+    if config.min_probe_successes >= config.probe.direct_count:
+        raise ConfigError(
+            f"scoring.toml [gate].min_probe_successes "
+            f"({config.min_probe_successes}) must be strictly below "
+            f"[probe].direct_count ({config.probe.direct_count}). Equal values "
+            "leave a miner no headroom at all: one timeout, or one honest 429 "
+            "while it was full, drops it below the floor and zeroes it for the "
+            "epoch — and twice in a row trips gate_out_after_misses into a "
+            "cooldown. Probe quality is already priced continuously by "
+            "reliability_bps; the gate is a sample-size floor, not a second "
+            "penalty for the same misses."
         )
     return config
 
@@ -542,9 +591,10 @@ def gate_bps(
             f"cooldown: {obs.cooldown_epochs_left} epoch(s) remaining",
         )
 
-    if obs.probe_successes < config.min_probes:
+    if obs.probe_successes < config.min_probe_successes:
         return config.gate_fail_bps, (
-            f"insufficient probes: {obs.probe_successes} < {config.min_probes}",
+            f"insufficient probes: {obs.probe_successes} < "
+            f"{config.min_probe_successes}",
         )
 
     if not obs.attested:
@@ -796,7 +846,7 @@ def score_epoch(
             reliability_by_source[source] = reliability_bps(sample)
 
         # A component nothing observed scores zero. That is only reachable
-        # for a miner the gate is about to fail anyway (min_probes), so it
+        # for a miner the gate is about to fail anyway (min_probe_successes), so it
         # never silently costs a working miner anything.
         latency = _or_zero(blend(latency_by_source, config.latency_sources))
         throughput = _or_zero(blend(throughput_by_source, config.throughput_sources))
