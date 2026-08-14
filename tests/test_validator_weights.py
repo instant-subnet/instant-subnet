@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from instant.validator import weights
 from instant.validator.score import (
     GateState,
     MinerObservations,
@@ -255,3 +256,62 @@ def test_old_matching_vector_is_resubmitted_to_refresh_last_update(
     assert result.reconciled is False
     assert result.attempts == 1
     assert len(chain.sent) == 1
+
+
+# --- chain-normalised readback ----------------------------------------------
+
+
+def test_the_chain_renormalises_to_max_u16():
+    # Observed against the live localnet: a two-miner vector submitted as
+    # {1: 31173, 3: 34362} read back as {1: 59453, 3: 65535}. Same ratios,
+    # rescaled so the largest weight is u16::MAX.
+    assert weights.normalise_u16({1: 31173, 3: 34362}) == {1: 59453, 3: 65535}
+
+
+def test_normalising_a_single_miner_is_the_identity():
+    # Why the raw comparison appeared to work until a second miner existed.
+    assert weights.normalise_u16({1: 65535}) == {1: 65535}
+
+
+def test_normalisation_preserves_proportions():
+    normalised = weights.normalise_u16({1: 1000, 2: 2000, 3: 4000})
+    assert normalised[3] == 65535
+    assert normalised[2] == pytest.approx(normalised[3] // 2, abs=1)
+    assert normalised[1] == pytest.approx(normalised[3] // 4, abs=1)
+
+
+def test_an_all_zero_vector_normalises_to_itself():
+    assert weights.normalise_u16({1: 0, 2: 0}) == {1: 0, 2: 0}
+    assert weights.normalise_u16({}) == {}
+
+
+def test_readback_accepts_the_chains_rescaled_vector():
+    # The regression: this exact pair reported "finalized but readback differs"
+    # and marked a perfectly good multi-miner write as failed.
+    assert weights.readback_matches({1: 31173, 3: 34362}, {1: 59453, 3: 65535})
+
+
+def test_readback_tolerates_one_unit_of_chain_rounding():
+    assert weights.readback_matches({1: 31173, 3: 34362}, {1: 59452, 3: 65535})
+    assert weights.readback_matches({1: 31173, 3: 34362}, {1: 59454, 3: 65535})
+
+
+def test_readback_rejects_a_different_split():
+    # Same UIDs, materially different proportions: must still fail.
+    assert not weights.readback_matches({1: 31173, 3: 34362}, {1: 32767, 3: 65535})
+
+
+def test_readback_rejects_a_different_uid_set():
+    assert not weights.readback_matches({1: 65535}, {2: 65535})
+    assert not weights.readback_matches({1: 31173, 3: 34362}, {1: 65535})
+    assert not weights.readback_matches({1: 65535}, {})
+
+
+def test_readback_ignores_a_share_too_small_to_store():
+    # _readback keeps only positive weights, so a uid whose normalised share
+    # rounds to zero is absent from the chain map rather than present as 0.
+    expected = {1: 1, 2: 400_000, 3: 400_000}
+    assert weights.normalise_u16(expected)[1] == 0
+    assert weights.readback_matches(expected, {2: 65535, 3: 65535})
+    # ...but a uid with a real share going missing is still a mismatch.
+    assert not weights.readback_matches({1: 30000, 2: 35535}, {2: 65535})
