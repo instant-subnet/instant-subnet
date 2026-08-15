@@ -5,83 +5,37 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "instant-subnet"
 version = "0.1.0"
-description = "Instant — a Bittensor subnet for fast, attested inference"
+description = "The minimal Finney validator service for Instant subnet 46"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-
-# Pinned to majors, not exact versions, everywhere except bittensor and the
-# two constraints bittensor forces on us. Notes on the non-obvious ones:
-#
-#   fastapi ~=0.110.1
-#     Not a preference. bittensor 9.x declares `fastapi~=0.110.1`, so the
-#     0.110 line is the only one that can share an environment with the SDK.
-#     Asking for >=0.115 makes the resolver fail outright. Nothing in this
-#     codebase uses a fastapi feature newer than 0.110, and the full suite
-#     passes on 0.110.3, so this costs us nothing today. It is the thing to
-#     revisit first if we ever move to bittensor 10.x, which drops the
-#     ceiling to a plain `fastapi>=0.110.1`.
-#
-#   bittensor ==9.12.2
-#     Exact, because the SDK changes its metagraph and weight-setting
-#     surfaces between minors often enough that an unpinned upgrade has
-#     taken subnets offline. 9.12.2 is the last release of the 9.x line:
-#     same RPC generation as the runtime our localnet is on, with every
-#     9.x bugfix.
-#
-#   async-substrate-interface >=1.5.6,<2.0
-#     A transitive dependency we pin deliberately. bittensor 9.12.2 asks for
-#     `>=1.5.6` with no ceiling, and 2.x replaced scalecodec with cyscale,
-#     which refuses to import when scalecodec is present -- which bittensor
-#     itself still installs. Left to float, `pip install bittensor==9.12.2`
-#     resolves to a combination where `import bittensor` dies on a namespace
-#     conflict. The ceiling is what makes the install reproducible.
 dependencies = [
-  "fastapi~=0.110.1",
-  "uvicorn[standard]>=0.30,<1.0",
   "httpx>=0.27,<1.0",
-  "pydantic>=2.7,<3.0",
-  "base58>=2.1,<3.0",
-  "py-sr25519-bindings>=0.2,<1.0",
+  # The direct weight extrinsic is tested against this exact SDK surface.
   "bittensor==9.12.2",
+  # Bittensor 9 imports scalecodec; async-substrate-interface 2.x conflicts with it.
   "async-substrate-interface>=1.5.6,<2.0",
+  "python-dotenv>=1.0,<2.0",
 ]
 
 [project.optional-dependencies]
-# The protocol layer deliberately has no bittensor dependency, and the SDK is
-# imported lazily inside the one function that needs it, so the whole test
-# suite runs without a wallet and without a chain.
 dev = [
   "pytest>=8.0",
-  "pytest-asyncio>=0.24",
   "ruff>=0.6",
-  # scripts/e2e_sdk.py drives the customer path with the real client, because
-  # the product claim is "your OpenAI code works" and only the SDK tests that.
-  "openai>=1.40",
 ]
 
 [project.scripts]
-instant-miner = "instant.miner.main:main"
-instant-validator = "instant.validator.main:main"
-instant-platform = "instant.platform.main:main"
-instant-mock-vllm = "instant.mock_vllm.main:main"
+instant-validator = "instant_validator.service:main"
 
 [tool.setuptools.packages.find]
-include = ["instant*"]
+where = ["src"]
+include = ["instant_validator*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
-# Pinned explicitly: pytest-asyncio warns when this is unset and is changing
-# the default in a future release. Naming it means the upgrade does not
-# silently change how our async fixtures are scoped.
-asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
-  # A deprecation warning in this codebase is a bug that has not happened
-  # yet. The FastAPI on_event -> lifespan migration was found this way.
   "error::DeprecationWarning",
   "error::PendingDeprecationWarning",
-  # Not ours, and not fixable from here.
   "default::DeprecationWarning:bittensor",
   "default::DeprecationWarning:substrateinterface",
   "default::DeprecationWarning:async_substrate_interface",
@@ -93,7 +47,4 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
-ignore = [
-  "E501",   # line length is handled by the formatter, not by failing CI
-  "B008",   # FastAPI's Depends() in a default is the framework's idiom
-]
+ignore = ["E501"]

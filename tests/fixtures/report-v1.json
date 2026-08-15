@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "report_id": "finney-46-5000000-5000099",
+  "network": "finney",
+  "netuid": 46,
+  "period_start_block": 5000000,
+  "period_end_block": 5000099,
+  "created_at_ms": 1786708800000,
+  "signer": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+  "miners": [
+    {
+      "uid": 12,
+      "hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+      "requests": 100,
+      "successes": 98,
+      "failures": 2,
+      "prompt_tokens": 12000,
+      "completion_tokens": 24000,
+      "ttft_p50_ms": 180,
+      "ttft_p95_ms": 300,
+      "tokens_per_second_p50": 90,
+      "toploc_verified": 98,
+      "toploc_failed": 1,
+      "toploc_timed_out": 1
+    },
+    {
+      "uid": 37,
+      "hotkey": "5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y",
+      "requests": 50,
+      "successes": 45,
+      "failures": 5,
+      "prompt_tokens": 6000,
+      "completion_tokens": 10000,
+      "ttft_p50_ms": 350,
+      "ttft_p95_ms": 900,
+      "tokens_per_second_p50": 40,
+      "toploc_verified": 44,
+      "toploc_failed": 3,
+      "toploc_timed_out": 3
+    }
+  ],
+  "digest": "sha256:6a7098c8ac2b02d2057b5717ff23714cb5a417958ca2dce2d32aa75635ae17b8",
+  "signature": "bc7e5c158aedd125711cf2adc687c830fae10666f079a9e1b9f0a4a0b8a51417b77f456bed6cab8a198f4108d8df31d49111d778b44480e2b8614aec812e0c8f"
+}
