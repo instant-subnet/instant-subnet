@@ -9,15 +9,18 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+build/
+dist/
 
 # Runtime state and local configuration
 .env
 .env.*
-!.env.*.example
+!.env.example
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
 logs/
+var/
 
 # Generated and private local material (never publish)
 deal/
