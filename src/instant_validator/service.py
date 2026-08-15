@@ -1,4 +1,4 @@
-"""PM2-managed wait -> fetch -> score -> set_weights -> wait service."""
+"""PM2-managed burn or report-scoring loop."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Protocol
 
 from .config import ConfigError, Settings
 from .platform import PlatformClient
-from .scoring import SCORING_VERSION, normalize_weights, score_miners
+from .scoring import normalize_weights, score_miners
 from .state import StateStore
 from .weights import BittensorWeightWriter
 
@@ -19,7 +19,11 @@ log = logging.getLogger("instant.validator")
 
 
 class WeightWriter(Protocol):
-    def set_weights(self, weights: dict[int, int]) -> str: ...
+    def full_burn_plan(self) -> tuple[dict[int, int], int, int]: ...
+
+    def set_weights(
+        self, weights: dict[int, int], *, version_key: int | None = None
+    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,8 +39,8 @@ class ValidatorService:
     def __init__(
         self,
         settings: Settings,
-        client: PlatformClient,
-        state: StateStore,
+        client: PlatformClient | None,
+        state: StateStore | None,
         writer: WeightWriter | None,
     ) -> None:
         self.settings = settings
@@ -45,9 +49,20 @@ class ValidatorService:
         self.writer = writer
 
     def run_once(self, *, now_ms: int | None = None) -> RunOutcome:
-        """Apply the latest completed report at most once."""
+        """Ensure the launch burn vote, or apply one completed platform report."""
 
         timestamp = int(time.time() * 1000) if now_ms is None else now_ms
+        if self.settings.burn_miner_emissions:
+            if self.writer is None:
+                raise RuntimeError("burn mode requires a chain writer")
+            weights, version_key, block = self.writer.full_burn_plan()
+            if not self.settings.enable_weight_writes:
+                return RunOutcome("dry_run_burn", "burn", block, weights)
+            message = self.writer.set_weights(weights, version_key=version_key)
+            return RunOutcome("burn_applied", "burn", block, weights, message)
+
+        if self.client is None or self.state is None:
+            raise RuntimeError("scoring mode requires a platform client and state")
         report = self.client.fetch_latest(now_ms=timestamp)
         if self.state.is_applied(report):
             return RunOutcome(
@@ -85,11 +100,10 @@ class ValidatorService:
             try:
                 outcome = self.run_once()
                 log.info(
-                    "report=%s period_end=%d status=%s scoring_version=%d weights=%s chain=%s",
+                    "report=%s period_end=%d status=%s weights=%s chain=%s",
                     outcome.report_id,
                     outcome.period_end_block,
                     outcome.status,
-                    SCORING_VERSION,
                     outcome.weights,
                     outcome.chain_message or "-",
                 )
@@ -122,18 +136,20 @@ def main() -> int:
     for watched in (signal.SIGINT, signal.SIGTERM):
         signal.signal(watched, lambda *_: stop.set())
 
-    client = PlatformClient(settings)
+    burn = settings.burn_miner_emissions
+    client = None if burn else PlatformClient(settings)
+    state = None if burn else StateStore(settings.state_path)
     try:
-        writer = BittensorWeightWriter(settings) if settings.enable_weight_writes else None
-        ValidatorService(
-            settings=settings,
-            client=client,
-            state=StateStore(settings.state_path),
-            writer=writer,
-        ).run_forever(stop)
+        writer = (
+            BittensorWeightWriter(settings)
+            if burn or settings.enable_weight_writes
+            else None
+        )
+        ValidatorService(settings, client, state, writer).run_forever(stop)
     except Exception:  # noqa: BLE001 - initialization failure should let PM2 restart
         log.exception("validator initialization failed")
         return 3
     finally:
-        client.close()
+        if client is not None:
+            client.close()
     return 0

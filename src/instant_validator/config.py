@@ -56,7 +56,7 @@ class Settings:
     request_timeout_seconds: int
     state_path: Path
     enable_weight_writes: bool
-    weight_version_key: int
+    burn_miner_emissions: bool
     log_level: str
 
     @property
@@ -97,19 +97,21 @@ class Settings:
         if endpoint and urlparse(endpoint).scheme not in {"ws", "wss"}:
             raise ConfigError("INSTANT_CHAIN_ENDPOINT must use ws:// or wss://")
 
+        burn_miner_emissions = _boolean(values, "INSTANT_BURN_MINER_EMISSIONS", True)
+
         report_url = values.get(
             "INSTANT_PLATFORM_REPORT_URL",
             "https://api.instantsubnet.com/validator/v1/reports/latest",
         ).strip()
         parsed_report_url = urlparse(report_url)
-        if (
+        if not burn_miner_emissions and (
             parsed_report_url.scheme not in {"http", "https"}
             or not parsed_report_url.netloc
         ):
             raise ConfigError("INSTANT_PLATFORM_REPORT_URL must be an HTTP(S) URL")
 
         signer = values.get("INSTANT_PLATFORM_SIGNER", "").strip()
-        if not signer:
+        if not burn_miner_emissions and not signer:
             raise ConfigError("INSTANT_PLATFORM_SIGNER is required")
 
         poll_interval = _bounded(
@@ -136,12 +138,6 @@ class Settings:
             1,
             120,
         )
-        version_key = _bounded(
-            _integer(values, "INSTANT_WEIGHT_VERSION_KEY", 0),
-            "INSTANT_WEIGHT_VERSION_KEY",
-            0,
-            2_147_483_647,
-        )
         level = values.get("INSTANT_LOG_LEVEL", "INFO").strip().upper()
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigError("INSTANT_LOG_LEVEL is invalid")
@@ -165,6 +161,6 @@ class Settings:
                 values.get("INSTANT_STATE_PATH", "var/validator-state.json").strip()
             ).expanduser(),
             enable_weight_writes=_boolean(values, "INSTANT_ENABLE_WEIGHT_WRITES", False),
-            weight_version_key=version_key,
+            burn_miner_emissions=burn_miner_emissions,
             log_level=level,
         )

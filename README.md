@@ -3,20 +3,21 @@
 This public repository contains one thing: the validator service for Instant on
 Finney subnet 46.
 
-The service runs one deliberately small loop:
+The production default is a chain-only prelaunch full-burn-vote loop:
 
 ```text
-wait for the latest completed platform report
-  -> validate its schema, digest, SR25519 signature, network, netuid, and age
-  -> score the reported miner UIDs
-  -> normalize the scores into one weight vector
-  -> call set_weights directly
-  -> remember the applied report
+read one finalized chain snapshot
+  -> require Burn mode and commit/reveal disabled
+  -> resolve the current subnet-owner hotkey and UID
+  -> submit {owner UID: 65535}
+  -> wait for finalization
   -> wait and repeat
 ```
 
-Validators trust the signed platform miner roster for the MVP. They do not discover,
-probe, or connect to miners. There is no commit/reveal workflow in this launch path.
+This mode does not call the platform, score miners, or use report state. After an
+explicit launch decision, `INSTANT_BURN_MINER_EMISSIONS=false` switches to the small
+signed-report scoring loop documented below. Validators never probe or connect to
+miners, and this MVP does not implement commit/reveal.
 
 ## Repository boundary
 
@@ -43,7 +44,7 @@ layer, or private deployment topology.
 - Python 3.11
 - a validator wallet registered and permitted on Finney subnet 46
 - Node.js and PM2 for the long-running process
-- the platform's published report-signing SS58 address
+- the platform's published report-signing SS58 address after burn mode is disabled
 
 Wallet secrets stay in the normal Bittensor wallet directory and never enter this
 repository or `.env`.
@@ -60,7 +61,8 @@ python -m pip install -e .
 cp .env.example .env
 ```
 
-Fill in the wallet hotkey and `INSTANT_PLATFORM_SIGNER`, then protect the file:
+Fill in the validator wallet. `INSTANT_PLATFORM_SIGNER` is needed only after burn
+mode is disabled. Protect the private configuration file:
 
 ```sh
 chmod 600 .env
@@ -95,11 +97,15 @@ immediately.
 ### Safe first run
 
 `INSTANT_ENABLE_WEIGHT_WRITES=false` is the checked-in safety default. In this mode
-the process fetches, validates, scores, and logs the exact prospective UID/weight
-vector without touching Finney or advancing local state.
+the process performs the finalized chain checks and logs the exact prospective
+owner UID/weight vector without submitting an extrinsic. It refuses to proceed unless
+the subnet is in protocol `Burn` mode and commit/reveal is disabled.
 
-After the operator reviews that vector and receives approval for the first live
-write, set:
+Before deployment, the subnet owner or Root must disable commit/reveal. Keep the
+existing writers running until the dry run observes that change at a finalized block.
+
+After those checks pass, the operator reviews the dry-run vector and enables the
+first write:
 
 ```text
 INSTANT_ENABLE_WEIGHT_WRITES=true
@@ -111,11 +117,16 @@ Then restart the process:
 pm2 restart instant-validator
 ```
 
-A successfully finalized report is recorded in `INSTANT_STATE_PATH`. The same report,
-or an older completed period, is not submitted again. Failed platform fetches,
-invalid reports, empty/all-zero scores, and failed chain writes do not advance state.
+## Prelaunch full burn vote
+
+Burn is fixed at 100% in code; there is no percentage setting. The current owner UID
+and runtime weight version are resolved from one finalized chain block, so UID 238 or
+any other mutable UID is never hard-coded. With protocol Burn mode enabled, the
+owner-directed miner emission is recorded as burned instead of paid to that miner.
 
 ## Report v1
+
+This path is active only when `INSTANT_BURN_MINER_EMISSIONS=false`.
 
 The platform endpoint returns one immutable completed-period JSON document. Its exact
 golden example is in `tests/fixtures/report-v1.json`.
@@ -174,12 +185,12 @@ there are no hidden tuning modes or legacy policies.
 | `INSTANT_WALLET_NAME` | `validator` | validator wallet name |
 | `INSTANT_WALLET_HOTKEY` | `default` | validator hotkey name |
 | `INSTANT_WALLET_PATH` | `~/.bittensor/wallets` | wallet root |
-| `INSTANT_PLATFORM_REPORT_URL` | public Instant endpoint | latest report-v1 URL |
-| `INSTANT_PLATFORM_SIGNER` | required | trusted platform SS58 signer |
-| `INSTANT_POLL_INTERVAL_SECONDS` | `60` | delay between cycles |
+| `INSTANT_BURN_MINER_EMISSIONS` | `true` | chain-only prelaunch burn gate |
+| `INSTANT_PLATFORM_REPORT_URL` | public Instant endpoint | scoring-mode report-v1 URL |
+| `INSTANT_PLATFORM_SIGNER` | empty | required trusted signer in scoring mode |
+| `INSTANT_POLL_INTERVAL_SECONDS` | `60` | delay between cycles; example uses `3600` |
 | `INSTANT_REPORT_MAX_AGE_SECONDS` | `86400` | stale-report limit |
-| `INSTANT_STATE_PATH` | `var/validator-state.json` | last applied report |
-| `INSTANT_WEIGHT_VERSION_KEY` | `0` | Bittensor weight version key |
+| `INSTANT_STATE_PATH` | `var/validator-state.json` | scoring-mode last report |
 | `INSTANT_ENABLE_WEIGHT_WRITES` | `false` | explicit Finney write gate |
 
 See `.env.example` for the complete set.
