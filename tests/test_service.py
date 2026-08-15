@@ -22,25 +22,49 @@ class FakeWriter:
         self.error = error
         self.calls = []
 
-    def set_weights(self, weights):
-        self.calls.append(weights)
+    def full_burn_plan(self):
+        return {238: 65_535}, 62, 10_000
+
+    def set_weights(self, weights, *, version_key=None):
+        self.calls.append((weights, version_key))
         if self.error:
             raise self.error
         return "finalized"
 
 
-def settings(*, writes):
-    value = Settings.from_env(
+def settings(*, writes, burn=False):
+    return Settings.from_env(
         {
             "INSTANT_PLATFORM_SIGNER": "5Signer",
             "INSTANT_ENABLE_WEIGHT_WRITES": "true" if writes else "false",
+            "INSTANT_BURN_MINER_EMISSIONS": "true" if burn else "false",
         },
         load_env_file=False,
     )
-    return value
 
 
-def test_dry_run_logs_vector_but_does_not_advance_state(tmp_path, parsed_report):
+@pytest.mark.parametrize(
+    "writes, status, calls",
+    [
+        (False, "dry_run_burn", []),
+        (True, "burn_applied", [({238: 65_535}, 62)]),
+    ],
+)
+def test_burn_is_chain_only(writes, status, calls, parsed_report):
+    client = FakeClient(parsed_report)
+    writer = FakeWriter()
+    service = ValidatorService(settings(writes=writes, burn=True), client, None, writer)
+
+    outcome = service.run_once()
+
+    assert outcome.status == status
+    assert outcome.weights == {238: 65_535}
+    assert outcome.period_end_block == 10_000
+    assert writer.calls == calls
+    assert client.calls == 0
+
+
+def test_scoring_dry_run_logs_vector_but_does_not_advance_state(tmp_path, parsed_report):
     state = StateStore(tmp_path / "state.json")
     service = ValidatorService(
         settings(writes=False), FakeClient(parsed_report), state, writer=None
@@ -53,7 +77,9 @@ def test_dry_run_logs_vector_but_does_not_advance_state(tmp_path, parsed_report)
     assert state.load() is None
 
 
-def test_successful_write_advances_state_and_is_not_repeated(tmp_path, parsed_report):
+def test_successful_scoring_write_advances_state_and_is_not_repeated(
+    tmp_path, parsed_report
+):
     state = StateStore(tmp_path / "state.json")
     writer = FakeWriter()
     service = ValidatorService(
@@ -68,7 +94,7 @@ def test_successful_write_advances_state_and_is_not_repeated(tmp_path, parsed_re
     assert len(writer.calls) == 1
 
 
-def test_failed_write_does_not_mark_report_applied(tmp_path, parsed_report):
+def test_failed_scoring_write_does_not_mark_report_applied(tmp_path, parsed_report):
     state = StateStore(tmp_path / "state.json")
     writer = FakeWriter(error=RuntimeError("chain unavailable"))
     service = ValidatorService(

@@ -6,19 +6,24 @@ from instant_validator.config import ConfigError, Settings
 
 
 def values(**overrides):
-    base = {"INSTANT_PLATFORM_SIGNER": "5Signer"}
+    base = {
+        "INSTANT_PLATFORM_SIGNER": "5Signer",
+        "INSTANT_BURN_MINER_EMISSIONS": "false",
+    }
     base.update(overrides)
     return base
 
 
-def test_production_defaults_are_finney_46_and_writes_are_off():
-    settings = Settings.from_env(values(), load_env_file=False)
+def test_production_defaults_are_finney_46_with_burn_on_and_writes_off():
+    settings = Settings.from_env({}, load_env_file=False)
 
     assert settings.network == "finney"
     assert settings.netuid == 46
     assert settings.chain_endpoint == ""
     assert settings.chain_target == "finney"
     assert settings.enable_weight_writes is False
+    assert settings.burn_miner_emissions is True
+    assert settings.platform_signer == ""
 
 
 def test_private_environment_can_explicitly_select_another_chain():
@@ -47,6 +52,7 @@ def test_private_environment_can_explicitly_select_another_chain():
         ({"INSTANT_CHAIN_ENDPOINT": "http://chain.example"}, "must use ws"),
         ({"INSTANT_PLATFORM_REPORT_URL": "not-a-url"}, "HTTP"),
         ({"INSTANT_ENABLE_WEIGHT_WRITES": "sometimes"}, "true or false"),
+        ({"INSTANT_BURN_MINER_EMISSIONS": "sometimes"}, "true or false"),
         ({"INSTANT_POLL_INTERVAL_SECONDS": "1"}, "between 10"),
     ],
 )
