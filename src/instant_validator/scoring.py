@@ -1,4 +1,4 @@
-"""One deterministic MVP scoring function."""
+"""One deterministic miner-scoring function."""
 
 from __future__ import annotations
 
