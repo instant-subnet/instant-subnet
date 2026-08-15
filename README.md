@@ -3,7 +3,7 @@
 This public repository contains one thing: the validator service for Instant on
 Finney subnet 46.
 
-The production default is a chain-only prelaunch full-burn-vote loop:
+The production default is a chain-only full-burn-vote loop:
 
 ```text
 read one finalized chain snapshot
@@ -14,13 +14,10 @@ read one finalized chain snapshot
   -> wait and repeat
 ```
 
-The current Phase 0 burn mode does not call the platform, score miners, or use report
-state. Burn remains the only submitted chain vector through Phases 0–6 and acceptance
-of a real miner. Phase 4 adds signed-report scoring in shadow: it logs the prospective
-vector without submitting it while burn continues. Setting
-`INSTANT_BURN_MINER_EMISSIONS=false` is not approved before the separate final go-live
-cutover. Validators never probe or connect to miners, and this MVP does not implement
-commit/reveal.
+Burn mode does not call the platform, score miners, or use report state. Setting
+`INSTANT_BURN_MINER_EMISSIONS=false` switches to report-based scoring and requires
+explicit operator approval. Validators never probe or connect to
+miners, and this service does not implement commit/reveal.
 
 ## Repository boundary
 
@@ -34,7 +31,7 @@ commit/reveal.
 
 Miner installation and inference live in `instant-miner-kit`. Customer APIs, API
 keys, miner routing, metrics, and routing-state decisions live in `instant-platform`.
-The separate H200 service in `instant-verifier` returns pass/fail assertions only.
+The separate `instant-verifier` service returns pass/fail assertions only.
 The platform alone decides the resulting routing action, including temporary hold,
 operator review, and re-enablement.
 
@@ -47,8 +44,7 @@ layer, or private deployment topology.
 - Python 3.11
 - a validator wallet registered and permitted on Finney subnet 46
 - Node.js and PM2 for the long-running process
-- the platform's published report-signing SS58 address for Phase 4 shadow scoring and
-  the eventual final cutover
+- the platform's published report-signing SS58 address when report scoring is enabled
 
 Wallet secrets stay in the normal Bittensor wallet directory and never enter this
 repository or `.env`.
@@ -65,8 +61,8 @@ python -m pip install -e .
 cp .env.example .env
 ```
 
-Fill in the validator wallet. `INSTANT_PLATFORM_SIGNER` becomes required when Phase 4
-enables report validation for shadow scoring. Protect the private configuration file:
+Fill in the validator wallet. `INSTANT_PLATFORM_SIGNER` is required when report scoring
+is enabled. Protect the private configuration file:
 
 ```sh
 chmod 600 .env
@@ -121,25 +117,22 @@ Then restart the process:
 pm2 restart instant-validator
 ```
 
-## Prelaunch full burn vote
+## Full burn vote
 
 Burn is fixed at 100% in code; there is no percentage setting. The current owner UID
 and runtime weight version are resolved from one finalized chain block, so UID 238 or
 any other mutable UID is never hard-coded. With protocol Burn mode enabled, the
 owner-directed miner emission is recorded as burned instead of paid to that miner.
 
-Keep this path enabled through every implementation and acceptance phase. Disabling
-it requires all phases to pass, one real miner to be onboarded and accepted, review of
-the shadow vector, and a new explicit go-live approval. The burn implementation stays
-maintained after cutover as the production safety path.
+Keep this path enabled until end-to-end miner, reporting, and scoring behavior has been
+accepted and the exact performance vector has been reviewed. Disabling burn requires
+explicit operator approval. The burn implementation remains the production safety path.
 
 ## Report v1
 
-Phase 0 contains the report contract and deterministic scorer, but the current service
-only reaches them when `INSTANT_BURN_MINER_EMISSIONS=false`. Do not activate that mode
-during Phases 0–3. Phase 4 changes the service so it validates reports and logs the
-prospective vector concurrently with burn; the report-derived vector must remain
-unable to reach the chain until the separately approved final go-live cutover.
+The current service reads reports only when `INSTANT_BURN_MINER_EMISSIONS=false`.
+Burn and report scoring are mutually exclusive. Validate reports and prospective
+weights with chain writes disabled before submitting performance weights.
 
 The platform endpoint returns one immutable completed-period JSON document. Its exact
 golden example is in `tests/fixtures/report-v1.json`.
@@ -167,7 +160,7 @@ have one terminal TOPLOC outcome. The validator canonicalizes every field except
 and the platform signer's SR25519 signature over those exact bytes.
 
 The platform owns miner registration checks before a miner enters this report. The
-validator does not repeat the platform's Finney UID/hotkey lookup in the MVP.
+validator does not repeat the platform's Finney UID/hotkey lookup.
 
 ## Scoring v1
 
@@ -198,12 +191,12 @@ there are no hidden tuning modes or legacy policies.
 | `INSTANT_WALLET_NAME` | `validator` | validator wallet name |
 | `INSTANT_WALLET_HOTKEY` | `default` | validator hotkey name |
 | `INSTANT_WALLET_PATH` | `~/.bittensor/wallets` | wallet root |
-| `INSTANT_BURN_MINER_EMISSIONS` | `true` | required through Phases 0–6; false only at approved final go-live |
-| `INSTANT_PLATFORM_REPORT_URL` | public Instant endpoint | Phase 4 shadow-scoring and final report-v1 URL |
-| `INSTANT_PLATFORM_SIGNER` | empty | trusted signer required when Phase 4 shadow scoring begins |
+| `INSTANT_BURN_MINER_EMISSIONS` | `true` | true for 100% burn; false for approved report scoring |
+| `INSTANT_PLATFORM_REPORT_URL` | public Instant endpoint | report-v1 URL |
+| `INSTANT_PLATFORM_SIGNER` | empty | trusted signer required for report scoring |
 | `INSTANT_POLL_INTERVAL_SECONDS` | `60` | delay between cycles; example uses `3600` |
 | `INSTANT_REPORT_MAX_AGE_SECONDS` | `86400` | stale-report limit |
-| `INSTANT_STATE_PATH` | `var/validator-state.json` | shadow/final scoring report state |
+| `INSTANT_STATE_PATH` | `var/validator-state.json` | last applied report state |
 | `INSTANT_ENABLE_WEIGHT_WRITES` | `false` | explicit Finney write gate |
 
 See `.env.example` for the complete set.

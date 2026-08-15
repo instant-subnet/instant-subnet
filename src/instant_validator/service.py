@@ -49,7 +49,7 @@ class ValidatorService:
         self.writer = writer
 
     def run_once(self, *, now_ms: int | None = None) -> RunOutcome:
-        """Ensure the launch burn vote, or apply one completed platform report."""
+        """Ensure the full-burn vote, or apply one completed platform report."""
 
         timestamp = int(time.time() * 1000) if now_ms is None else now_ms
         if self.settings.burn_miner_emissions:
