@@ -31,7 +31,7 @@ miners, and this service does not implement commit/reveal.
 
 Miner installation and inference live in `instant-miner-kit`. Customer APIs, API
 keys, miner routing, metrics, and routing-state decisions live in `instant-platform`.
-The separate H200 service in `instant-verifier` returns pass/fail assertions only.
+The separate `instant-verifier` service returns pass/fail assertions only.
 The platform alone decides the resulting routing action, including temporary hold,
 operator review, and re-enablement.
 
