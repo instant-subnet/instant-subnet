@@ -34,6 +34,3 @@ customer traffic, not an additional request-routing hop.
 
 Bittensor coordinates registration, validator authority, weights, and incentives.
 Customer prompts and generated responses do not belong on-chain.
-
-The detailed protocol and deployment design remain under active development on the
-`dev` branch and will be promoted here as interfaces stabilize.
