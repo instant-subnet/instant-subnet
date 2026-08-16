@@ -205,11 +205,6 @@ See `.env.example` for the complete set.
 
 ```sh
 python -m pip install -e '.[dev]'
-ruff check src tests scripts
+ruff check src tests
 pytest -q
-python scripts/check_repository.py
 ```
-
-The repository guard fails if the entire tracked repository reaches 12,500 lines,
-if an unexpected service tree is added, or if public files reintroduce local-chain
-defaults, literal WebSocket IPs, or retired entrypoints.
