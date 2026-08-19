@@ -17,6 +17,21 @@ from .scoring import log_score_records, score_report
 from .state import StateError, StateStore
 
 LOG = logging.getLogger("instant.validator")
+
+
+def _ensure_log_visibility() -> None:
+    """Undo bittensor's btlogging, which strips this logger's handlers and
+    raises its level to CRITICAL when the SDK is imported."""
+    LOG.disabled = False
+    LOG.setLevel(logging.INFO)
+    if not LOG.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        LOG.addHandler(handler)
+    LOG.propagate = False
+
 SS58_FORMAT = 42
 DEFAULT_REPORT_URL = "https://api.instantsubnet.com/validator/v1/reports/latest"
 
@@ -244,16 +259,6 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    # The lazy bittensor import replaces the root handlers, which silences
-    # LOG.exception below. Give this logger its own handler so failures stay
-    # visible in the scheduled-run log.
-    if not LOG.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-        )
-        LOG.addHandler(handler)
-    LOG.propagate = False
     try:
         burn_enabled = (
             _environment_flag("INSTANT_BURN_ENABLED") if args.burn is None else args.burn
@@ -279,17 +284,20 @@ def main(argv: list[str] | None = None) -> int:
             if burn_enabled
             else None
         )
+        chain = BittensorChain(args.network, args.chain_endpoint)
+        _ensure_log_visibility()
         run_once(
             network=args.network,
             netuid=args.netuid,
             report_url=args.report_url,
             platform_signer=args.platform_signer,
-            chain=BittensorChain(args.network, args.chain_endpoint),
+            chain=chain,
             state=StateStore(Path(args.state_path)),
             burner=burner,
             timeout=args.timeout,
         )
     except (BurnError, ChainError, ReportError, StateError, RuntimeError):
+        _ensure_log_visibility()
         LOG.exception("Validator run failed")
         return 1
     return 0
