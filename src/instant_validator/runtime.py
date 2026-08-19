@@ -244,6 +244,16 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # The lazy bittensor import replaces the root handlers, which silences
+    # LOG.exception below. Give this logger its own handler so failures stay
+    # visible in the scheduled-run log.
+    if not LOG.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        LOG.addHandler(handler)
+    LOG.propagate = False
     try:
         burn_enabled = (
             _environment_flag("INSTANT_BURN_ENABLED") if args.burn is None else args.burn
