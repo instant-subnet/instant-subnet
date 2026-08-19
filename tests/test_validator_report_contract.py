@@ -5,6 +5,7 @@ import json
 import unittest
 from pathlib import Path
 
+from instant_validator.scoring import score_report
 
 FIXTURES = Path(__file__).parent / "fixtures"
 REPORT_KEYS = {
@@ -116,57 +117,23 @@ class ValidatorReportContractTests(unittest.TestCase):
                 self.assertEqual(row["generation_tps_p50"], 0)
 
     def test_scoring_fixture_uses_frozen_relative_integer_math(self) -> None:
-        miners = self.report["miners"]
-        clean = [
-            row
-            for row in miners
-            if row["proof_failed_requests"] == 0
-            and row["proof_timed_out_requests"] == 0
+        calculated = [
+            {
+                key: record[key]
+                for key in (
+                    "disqualified",
+                    "normalized_weight",
+                    "raw_score_bps",
+                    "requests_bps",
+                    "score_bps",
+                    "speed_bps",
+                    "success_bps",
+                    "tokens_bps",
+                    "uid",
+                )
+            }
+            for record in score_report(self.report)
         ]
-        maxima = {
-            "speed": max(row["generation_tps_p50"] for row in clean),
-            "tokens": max(row["verified_completion_tokens"] for row in clean),
-            "requests": max(row["successful_requests"] for row in clean),
-        }
-        calculated = []
-        raw_rows = []
-        for row in miners:
-            speed = row["generation_tps_p50"] * 10_000 // maxima["speed"]
-            tokens = row["verified_completion_tokens"] * 10_000 // maxima["tokens"]
-            requests = row["successful_requests"] * 10_000 // maxima["requests"]
-            success = row["successful_requests"] * 10_000 // row["routed_requests"]
-            raw_score = (60 * speed + 25 * tokens + 10 * requests + 5 * success) // 100
-            disqualified = (
-                row["proof_failed_requests"] > 0 or row["proof_timed_out_requests"] > 0
-            )
-            score = 0 if disqualified else raw_score
-            raw_rows.append(
-                (row, speed, tokens, requests, success, raw_score, score, disqualified)
-            )
-        highest = max(item[-2] for item in raw_rows)
-        for (
-            row,
-            speed,
-            tokens,
-            requests,
-            success,
-            raw_score,
-            score,
-            disqualified,
-        ) in raw_rows:
-            calculated.append(
-                {
-                    "disqualified": disqualified,
-                    "normalized_weight": score * 65_535 // highest if score else 0,
-                    "raw_score_bps": raw_score,
-                    "requests_bps": requests,
-                    "score_bps": score,
-                    "speed_bps": speed,
-                    "success_bps": success,
-                    "tokens_bps": tokens,
-                    "uid": row["uid"],
-                }
-            )
         expected = json.loads((FIXTURES / "validator_scores_v1.json").read_text())[
             "scores"
         ]
