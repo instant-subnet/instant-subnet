@@ -17,6 +17,7 @@ from .scoring import log_score_records, score_report
 from .state import StateError, StateStore
 
 LOG = logging.getLogger("instant.validator")
+SS58_FORMAT = 42
 DEFAULT_REPORT_URL = "https://api.instantsubnet.com/validator/v1/reports/latest"
 
 
@@ -33,6 +34,17 @@ class ChainError(RuntimeError):
     """Finalized chain state is unavailable or inconsistent."""
 
 
+def _account_ss58(value: Any) -> str:
+    """Decode a storage account value to its SS58 address."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    from scalecodec.utils.ss58 import ss58_encode
+
+    return ss58_encode(bytes(value), SS58_FORMAT)
+
+
 class BittensorChain:
     def __init__(self, network: str, endpoint: str, *, sdk: Any = None) -> None:
         if sdk is None:
@@ -42,27 +54,43 @@ class BittensorChain:
 
     def snapshot(self, netuid: int) -> ChainSnapshot:
         try:
-            head = self._subtensor.substrate.get_chain_finalised_head()
-            block = self._subtensor.substrate.get_block_number(head)
-            info = self._subtensor.get_metagraph_info(netuid, block=block)
+            substrate = self._subtensor.substrate
+            head = substrate.get_chain_finalised_head()
+            block = substrate.get_block_number(head)
+
+            def query(storage: str, params: list[Any]) -> Any:
+                result = substrate.query(
+                    "SubtensorModule", storage, params, block_hash=head
+                )
+                return getattr(result, "value", result)
+
+            size = query("SubnetworkN", [netuid])
+            tempo = query("Tempo", [netuid])
+            last_step = query("LastMechansimStepBlock", [netuid])
+            blocks_since_last_step = query("BlocksSinceLastStep", [netuid])
+            last_updates = tuple(query("LastUpdate", [netuid]))
+            roster: dict[int, Any] = {}
+            for uid, hotkey in substrate.query_map(
+                "SubtensorModule", "Keys", [netuid], block_hash=head, page_size=512
+            ):
+                roster[getattr(uid, "value", uid)] = getattr(hotkey, "value", hotkey)
+            hotkeys = tuple(_account_ss58(roster[uid]) for uid in range(size))
         except Exception as exc:
             raise ChainError(f"finalized chain lookup failed: {exc}") from exc
-        if info is None:
-            raise ChainError("finalized metagraph is unavailable")
-        values = (block, info.tempo, info.last_step, info.blocks_since_last_step)
+        if type(size) is not int or size < 1:
+            raise ChainError("finalized subnet is empty or unknown")
+        values = (block, tempo, last_step, blocks_since_last_step)
         if any(type(value) is not int or value < 0 for value in values):
             raise ChainError("finalized epoch state is invalid")
-        if info.tempo < 1 or info.last_step + info.blocks_since_last_step != block:
+        if tempo < 1 or last_step + blocks_since_last_step != block:
             raise ChainError("finalized epoch state is inconsistent")
-        hotkeys = tuple(str(value) for value in info.hotkeys)
-        last_updates = tuple(info.last_update)
         if (
             any(not value for value in hotkeys)
             or len(hotkeys) != len(last_updates)
             or any(type(value) is not int or value < 0 for value in last_updates)
         ):
             raise ChainError("finalized hotkey roster is invalid")
-        return ChainSnapshot(block, info.tempo, info.last_step, hotkeys, last_updates)
+        return ChainSnapshot(block, tempo, last_step, hotkeys, last_updates)
 
 
 def fetch_report(url: str, timeout: int) -> bytes:
@@ -216,6 +244,16 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # The lazy bittensor import replaces the root handlers, which silences
+    # LOG.exception below. Give this logger its own handler so failures stay
+    # visible in the scheduled-run log.
+    if not LOG.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+        LOG.addHandler(handler)
+    LOG.propagate = False
     try:
         burn_enabled = (
             _environment_flag("INSTANT_BURN_ENABLED") if args.burn is None else args.burn

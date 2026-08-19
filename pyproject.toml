@@ -8,6 +8,8 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
   "bittensor==9.12.2",
+  # Bittensor 9 imports scalecodec; async-substrate-interface 2.x conflicts with it.
+  "async-substrate-interface>=1.5.6,<2.0",
   "bittensor-wallet==4.0.1",
 ]
 

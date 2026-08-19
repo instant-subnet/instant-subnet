@@ -102,26 +102,64 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(snapshot=snapshot), self.assertRaises(ChainError):
                 validate_chain(self.report, snapshot)
 
-    def test_bittensor_adapter_reads_finalized_metagraph(self) -> None:
+    def test_bittensor_adapter_reads_finalized_storage(self) -> None:
+        values = {
+            "SubnetworkN": 1,
+            "Tempo": 360,
+            "LastMechansimStepBlock": 720,
+            "BlocksSinceLastStep": 2,
+            "LastUpdate": [700],
+        }
         substrate = mock.Mock()
         substrate.get_chain_finalised_head.return_value = "0xhead"
         substrate.get_block_number.return_value = 722
-        subtensor = mock.Mock(substrate=substrate)
-        subtensor.get_metagraph_info.return_value = SimpleNamespace(
-            tempo=360,
-            last_step=720,
-            blocks_since_last_step=2,
-            hotkeys=["hotkey-0"],
-            last_update=[700],
+        substrate.query.side_effect = lambda module, storage, params, block_hash: (
+            SimpleNamespace(value=values[storage])
         )
+        substrate.query_map.return_value = [(0, SimpleNamespace(value="hotkey-0"))]
+        subtensor = mock.Mock(substrate=substrate)
         sdk = mock.Mock()
         sdk.subtensor.return_value = subtensor
 
         snapshot = BittensorChain("local", "ws://chain", sdk=sdk).snapshot(46)
 
         sdk.subtensor.assert_called_once_with(network="ws://chain")
-        subtensor.get_metagraph_info.assert_called_once_with(46, block=722)
+        substrate.query.assert_any_call(
+            "SubtensorModule", "Tempo", [46], block_hash="0xhead"
+        )
+        substrate.query_map.assert_called_once_with(
+            "SubtensorModule", "Keys", [46], block_hash="0xhead", page_size=512
+        )
         self.assertEqual(snapshot, ChainSnapshot(722, 360, 720, ("hotkey-0",), (700,)))
+
+    def test_bittensor_adapter_decodes_raw_account_bytes(self) -> None:
+        raw = (
+            176, 116, 52, 235, 88, 16, 239, 83, 225, 14, 3, 243, 79, 222, 208, 242,
+            75, 195, 154, 124, 220, 208, 95, 210, 106, 238, 217, 235, 197, 120, 72, 23,
+        )
+        values = {
+            "SubnetworkN": 1,
+            "Tempo": 360,
+            "LastMechansimStepBlock": 720,
+            "BlocksSinceLastStep": 2,
+            "LastUpdate": [700],
+        }
+        substrate = mock.Mock()
+        substrate.get_chain_finalised_head.return_value = "0xhead"
+        substrate.get_block_number.return_value = 722
+        substrate.query.side_effect = lambda module, storage, params, block_hash: (
+            SimpleNamespace(value=values[storage])
+        )
+        substrate.query_map.return_value = [(0, SimpleNamespace(value=[raw]))]
+        sdk = mock.Mock()
+        sdk.subtensor.return_value = mock.Mock(substrate=substrate)
+
+        snapshot = BittensorChain("local", "ws://chain", sdk=sdk).snapshot(46)
+
+        self.assertEqual(
+            snapshot.hotkeys,
+            ("5G44ofsENjXcNRNLVPKRjPvbqBaiZWFGkYxKawTaUx4GE8b1",),
+        )
 
     def test_report_and_burn_are_each_handled_once(self) -> None:
         burner = _Burner(self.snapshot.hotkeys[12])
