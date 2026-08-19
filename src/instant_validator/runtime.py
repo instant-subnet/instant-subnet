@@ -175,10 +175,17 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="instant-validator")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run-once")
-    run.add_argument("--network", default="finney")
-    run.add_argument("--netuid", type=int, default=46)
-    run.add_argument("--chain-endpoint", default="")
-    run.add_argument("--report-url", default=DEFAULT_REPORT_URL)
+    run.add_argument("--network", default=os.environ.get("INSTANT_NETWORK", "finney"))
+    run.add_argument(
+        "--netuid", type=int, default=int(os.environ.get("INSTANT_NETUID", "46"))
+    )
+    run.add_argument(
+        "--chain-endpoint", default=os.environ.get("INSTANT_CHAIN_ENDPOINT", "")
+    )
+    run.add_argument(
+        "--report-url",
+        default=os.environ.get("INSTANT_PLATFORM_REPORT_URL", DEFAULT_REPORT_URL),
+    )
     run.add_argument(
         "--platform-signer", default=os.environ.get("INSTANT_PLATFORM_SIGNER", "")
     )
