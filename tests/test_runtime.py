@@ -4,9 +4,11 @@ import json
 import logging
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
+from instant_validator.burn import BurnError
 from instant_validator.runtime import (
     BittensorChain,
     ChainError,
@@ -15,6 +17,7 @@ from instant_validator.runtime import (
     run_once,
     validate_chain,
 )
+from instant_validator.state import StateStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -29,6 +32,19 @@ class _Chain:
         return self.value
 
 
+class _Burner:
+    def __init__(self, hotkey: str, *, fail: bool = False) -> None:
+        self.hotkey = hotkey
+        self.fail = fail
+        self.calls: list[tuple[int, int]] = []
+
+    def submit(self, *, netuid: int, finalized_block: int) -> str:
+        self.calls.append((netuid, finalized_block))
+        if self.fail:
+            raise BurnError("failed")
+        return "finalized"
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.raw = (FIXTURES / "validator_report_v1.json").read_bytes().rstrip(b"\n")
@@ -41,7 +57,11 @@ class RuntimeTests(unittest.TestCase):
             tempo=self.report["tempo"],
             last_step=self.report["epoch_end_block"],
             hotkeys=tuple(hotkeys),
+            last_updates=tuple(0 for _ in hotkeys),
         )
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.state = StateStore(Path(self.temporary.name) / "state.json")
 
     def test_run_once_fetches_authenticates_scores_logs_and_exits(self) -> None:
         chain = _Chain(self.snapshot)
@@ -52,6 +72,7 @@ class RuntimeTests(unittest.TestCase):
                 report_url="https://platform.invalid/latest",
                 platform_signer=self.report["signer"],
                 chain=chain,
+                state=self.state,
                 fetch=lambda url, timeout: self.raw,
             )
 
@@ -65,10 +86,16 @@ class RuntimeTests(unittest.TestCase):
 
     def test_chain_must_match_report_epoch_and_roster(self) -> None:
         invalid = [
-            ChainSnapshot(722, 361, 720, self.snapshot.hotkeys),
-            ChainSnapshot(722, 360, 719, self.snapshot.hotkeys),
-            ChainSnapshot(719, 360, 720, self.snapshot.hotkeys),
-            ChainSnapshot(722, 360, 720, self.snapshot.hotkeys[:55]),
+            ChainSnapshot(722, 361, 720, self.snapshot.hotkeys, self.snapshot.last_updates),
+            ChainSnapshot(722, 360, 719, self.snapshot.hotkeys, self.snapshot.last_updates),
+            ChainSnapshot(719, 360, 720, self.snapshot.hotkeys, self.snapshot.last_updates),
+            ChainSnapshot(
+                722,
+                360,
+                720,
+                self.snapshot.hotkeys[:55],
+                self.snapshot.last_updates[:55],
+            ),
         ]
 
         for snapshot in invalid:
@@ -85,6 +112,7 @@ class RuntimeTests(unittest.TestCase):
             last_step=720,
             blocks_since_last_step=2,
             hotkeys=["hotkey-0"],
+            last_update=[700],
         )
         sdk = mock.Mock()
         sdk.subtensor.return_value = subtensor
@@ -93,7 +121,83 @@ class RuntimeTests(unittest.TestCase):
 
         sdk.subtensor.assert_called_once_with(network="ws://chain")
         subtensor.get_metagraph_info.assert_called_once_with(46, block=722)
-        self.assertEqual(snapshot, ChainSnapshot(722, 360, 720, ("hotkey-0",)))
+        self.assertEqual(snapshot, ChainSnapshot(722, 360, 720, ("hotkey-0",), (700,)))
+
+    def test_report_and_burn_are_each_handled_once(self) -> None:
+        burner = _Burner(self.snapshot.hotkeys[12])
+        arguments = {
+            "network": self.report["network"],
+            "netuid": self.report["netuid"],
+            "report_url": "https://platform.invalid/latest",
+            "platform_signer": self.report["signer"],
+            "chain": _Chain(self.snapshot),
+            "state": self.state,
+            "burner": burner,
+            "fetch": lambda url, timeout: self.raw,
+        }
+
+        first = run_once(**arguments)
+        second = run_once(**arguments)
+
+        self.assertEqual(len(first), 3)
+        self.assertEqual(second, ())
+        self.assertEqual(burner.calls, [(46, 722)])
+        saved = self.state.load()
+        self.assertEqual(saved.report_id, self.report["report_id"])
+        self.assertEqual(saved.report_digest, self.report["digest"])
+        self.assertEqual(saved.report_epoch_end_block, 720)
+        self.assertEqual(saved.burn_epoch_end_block, 720)
+
+    def test_chain_last_update_prevents_burn_after_local_state_loss(self) -> None:
+        hotkey = self.snapshot.hotkeys[12]
+        last_updates = list(self.snapshot.last_updates)
+        last_updates[12] = self.report["epoch_end_block"]
+        snapshot = ChainSnapshot(
+            self.snapshot.finalized_block,
+            self.snapshot.tempo,
+            self.snapshot.last_step,
+            self.snapshot.hotkeys,
+            tuple(last_updates),
+        )
+        burner = _Burner(hotkey)
+
+        run_once(
+            network=self.report["network"],
+            netuid=self.report["netuid"],
+            report_url="https://platform.invalid/latest",
+            platform_signer=self.report["signer"],
+            chain=_Chain(snapshot),
+            state=self.state,
+            burner=burner,
+            fetch=lambda url, timeout: self.raw,
+        )
+
+        self.assertEqual(burner.calls, [])
+        self.assertEqual(self.state.load().burn_epoch_end_block, 720)
+
+    def test_failed_burn_is_retried_without_reprocessing_report(self) -> None:
+        burner = _Burner(self.snapshot.hotkeys[12], fail=True)
+        arguments = {
+            "network": self.report["network"],
+            "netuid": self.report["netuid"],
+            "report_url": "https://platform.invalid/latest",
+            "platform_signer": self.report["signer"],
+            "chain": _Chain(self.snapshot),
+            "state": self.state,
+            "burner": burner,
+            "fetch": lambda url, timeout: self.raw,
+        }
+
+        with self.assertRaises(BurnError):
+            run_once(**arguments)
+        self.assertIsNone(self.state.load().burn_epoch_end_block)
+        burner.fail = False
+
+        records = run_once(**arguments)
+
+        self.assertEqual(records, ())
+        self.assertEqual(burner.calls, [(46, 722), (46, 722)])
+        self.assertEqual(self.state.load().burn_epoch_end_block, 720)
 
     def test_cli_requires_platform_signer_before_chain_contact(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):

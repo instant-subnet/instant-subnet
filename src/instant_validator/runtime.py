@@ -7,11 +7,14 @@ import logging
 import os
 import urllib.request
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
+from .burn import BittensorBurnWriter, BurnError
 from .report import MAX_REPORT_BYTES, ReportError, parse_report
 from .scoring import log_score_records, score_report
+from .state import StateError, StateStore
 
 LOG = logging.getLogger("instant.validator")
 DEFAULT_REPORT_URL = "https://api.instantsubnet.com/validator/v1/reports/latest"
@@ -23,6 +26,7 @@ class ChainSnapshot:
     tempo: int
     last_step: int
     hotkeys: tuple[str, ...]
+    last_updates: tuple[int, ...]
 
 
 class ChainError(RuntimeError):
@@ -51,9 +55,14 @@ class BittensorChain:
         if info.tempo < 1 or info.last_step + info.blocks_since_last_step != block:
             raise ChainError("finalized epoch state is inconsistent")
         hotkeys = tuple(str(value) for value in info.hotkeys)
-        if any(not value for value in hotkeys):
+        last_updates = tuple(info.last_update)
+        if (
+            any(not value for value in hotkeys)
+            or len(hotkeys) != len(last_updates)
+            or any(type(value) is not int or value < 0 for value in last_updates)
+        ):
             raise ChainError("finalized hotkey roster is invalid")
-        return ChainSnapshot(block, info.tempo, info.last_step, hotkeys)
+        return ChainSnapshot(block, info.tempo, info.last_step, hotkeys, last_updates)
 
 
 def fetch_report(url: str, timeout: int) -> bytes:
@@ -93,6 +102,8 @@ def run_once(
     report_url: str,
     platform_signer: str,
     chain: BittensorChain,
+    state: StateStore,
+    burner: BittensorBurnWriter | None = None,
     timeout: int = 15,
     fetch: Callable[[str, int], bytes] = fetch_report,
 ) -> tuple[dict[str, Any], ...]:
@@ -104,15 +115,60 @@ def run_once(
         expected_signer=platform_signer,
     )
     validate_chain(report, snapshot)
-    records = score_report(report)
-    log_score_records(records, LOG)
-    LOG.info(
-        "report_processed report_id=%s finalized_block=%d miners=%d",
-        report["report_id"],
-        snapshot.finalized_block,
-        len(records),
-    )
+    saved = state.load()
+    report_end = report["epoch_end_block"]
+    if (
+        saved.report_epoch_end_block is not None
+        and saved.report_epoch_end_block > report_end
+    ):
+        raise StateError("Platform returned a report older than local state")
+    already_processed = saved.report_epoch_end_block == report_end
+    if already_processed and (
+        saved.report_id != report["report_id"] or saved.report_digest != report["digest"]
+    ):
+        raise StateError("A processed report changed")
+
+    records: tuple[dict[str, Any], ...] = ()
+    if already_processed:
+        LOG.info("report_already_processed report_id=%s", report["report_id"])
+    else:
+        records = score_report(report)
+        saved = replace(
+            saved,
+            report_id=report["report_id"],
+            report_digest=report["digest"],
+            report_epoch_end_block=report_end,
+        )
+        state.save(saved)
+        log_score_records(records, LOG)
+        LOG.info(
+            "report_processed report_id=%s finalized_block=%d miners=%d",
+            report["report_id"],
+            snapshot.finalized_block,
+            len(records),
+        )
+
+    if burner is not None and saved.burn_epoch_end_block != report_end:
+        try:
+            validator_uid = snapshot.hotkeys.index(burner.hotkey)
+        except ValueError as exc:
+            raise BurnError("Validator hotkey is not registered") from exc
+        if snapshot.last_updates[validator_uid] >= report_end:
+            LOG.info("burn_already_on_chain epoch_end_block=%d", report_end)
+        else:
+            message = burner.submit(
+                netuid=report["netuid"], finalized_block=snapshot.finalized_block
+            )
+            LOG.info("burn_submitted epoch_end_block=%d result=%s", report_end, message)
+        state.save(replace(saved, burn_epoch_end_block=report_end))
     return records
+
+
+def _environment_flag(name: str) -> bool:
+    value = os.environ.get(name, "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be true or false")
+    return value == "true"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -127,6 +183,23 @@ def _parser() -> argparse.ArgumentParser:
         "--platform-signer", default=os.environ.get("INSTANT_PLATFORM_SIGNER", "")
     )
     run.add_argument("--timeout", type=int, default=15)
+    run.add_argument(
+        "--state-path",
+        default=os.environ.get(
+            "INSTANT_VALIDATOR_STATE_PATH", "/var/lib/instant-validator/state.json"
+        ),
+    )
+    run.add_argument("--burn", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument(
+        "--wallet-name", default=os.environ.get("INSTANT_WALLET_NAME", "validator")
+    )
+    run.add_argument(
+        "--wallet-hotkey", default=os.environ.get("INSTANT_WALLET_HOTKEY", "default")
+    )
+    run.add_argument(
+        "--wallet-path",
+        default=os.environ.get("INSTANT_WALLET_PATH", "~/.bittensor/wallets"),
+    )
     return parser
 
 
@@ -136,6 +209,13 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    try:
+        burn_enabled = (
+            _environment_flag("INSTANT_BURN_ENABLED") if args.burn is None else args.burn
+        )
+    except ValueError as exc:
+        LOG.error("%s", exc)
+        return 2
     if not args.platform_signer:
         LOG.error("--platform-signer or INSTANT_PLATFORM_SIGNER is required")
         return 2
@@ -143,15 +223,28 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error("netuid and timeout must be positive")
         return 2
     try:
+        burner = (
+            BittensorBurnWriter(
+                network=args.network,
+                endpoint=args.chain_endpoint,
+                wallet_name=args.wallet_name,
+                wallet_hotkey=args.wallet_hotkey,
+                wallet_path=str(Path(args.wallet_path).expanduser()),
+            )
+            if burn_enabled
+            else None
+        )
         run_once(
             network=args.network,
             netuid=args.netuid,
             report_url=args.report_url,
             platform_signer=args.platform_signer,
             chain=BittensorChain(args.network, args.chain_endpoint),
+            state=StateStore(Path(args.state_path)),
+            burner=burner,
             timeout=args.timeout,
         )
-    except (ChainError, ReportError, RuntimeError):
+    except (BurnError, ChainError, ReportError, StateError, RuntimeError):
         LOG.exception("Validator run failed")
         return 1
     return 0
