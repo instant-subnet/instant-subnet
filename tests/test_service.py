@@ -43,6 +43,21 @@ def settings(*, writes, burn=False):
     )
 
 
+def proof_clean(report):
+    return replace(
+        report,
+        miners=tuple(
+            replace(
+                row,
+                toploc_verified=row.requests,
+                toploc_failed=0,
+                toploc_timed_out=0,
+            )
+            for row in report.miners
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     "writes, status, calls",
     [
@@ -67,13 +82,13 @@ def test_burn_is_chain_only(writes, status, calls, parsed_report):
 def test_scoring_dry_run_logs_vector_but_does_not_advance_state(tmp_path, parsed_report):
     state = StateStore(tmp_path / "state.json")
     service = ValidatorService(
-        settings(writes=False), FakeClient(parsed_report), state, writer=None
+        settings(writes=False), FakeClient(proof_clean(parsed_report)), state, writer=None
     )
 
     outcome = service.run_once(now_ms=1_786_708_811_000)
 
     assert outcome.status == "dry_run"
-    assert outcome.weights == {12: 65_535, 37: 58_296}
+    assert outcome.weights == {12: 65_535, 37: 30_287}
     assert state.load() is None
 
 
@@ -83,7 +98,7 @@ def test_successful_scoring_write_advances_state_and_is_not_repeated(
     state = StateStore(tmp_path / "state.json")
     writer = FakeWriter()
     service = ValidatorService(
-        settings(writes=True), FakeClient(parsed_report), state, writer
+        settings(writes=True), FakeClient(proof_clean(parsed_report)), state, writer
     )
 
     first = service.run_once(now_ms=1_786_708_811_000)
@@ -98,7 +113,7 @@ def test_failed_scoring_write_does_not_mark_report_applied(tmp_path, parsed_repo
     state = StateStore(tmp_path / "state.json")
     writer = FakeWriter(error=RuntimeError("chain unavailable"))
     service = ValidatorService(
-        settings(writes=True), FakeClient(parsed_report), state, writer
+        settings(writes=True), FakeClient(proof_clean(parsed_report)), state, writer
     )
 
     with pytest.raises(RuntimeError, match="chain unavailable"):
