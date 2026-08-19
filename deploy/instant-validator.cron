@@ -1,0 +1,1 @@
+*/5 * * * * flock -n /var/lock/instant-validator.lock instant-validator run-once
