@@ -18,6 +18,16 @@ def _load(name: str, path: str):
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_finney_defaults_pin_the_platform_report_signer(self) -> None:
+        environment = (ROOT / ".env.example").read_text()
+
+        self.assertIn(
+            "INSTANT_PLATFORM_SIGNER="
+            "5E1oV49jn5s2pZMkn1NSNCE3pU6afjKMcAhDPvy2iZacQVp5\n",
+            environment,
+        )
+        self.assertNotIn("REPLACE_WITH_PLATFORM_SS58", environment)
+
     def test_updater_fast_forwards_main_and_syncs_only_when_changed(self) -> None:
         updater = _load("validator_updater", "scripts/update_validator.py")
         outputs = iter(["a" * 40, "", "b" * 40, "", ""])
